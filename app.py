@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import time
+import os
 from io import BytesIO
 from datetime import datetime
 from selenium import webdriver
@@ -11,6 +12,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
 
 # ============================================================
 # 設定
@@ -62,8 +64,27 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,800")
-    options.binary_location = "/usr/bin/chromium"
-    service = Service("/usr/bin/chromedriver")
+
+    # Chromiumのパスを自動検索
+    for binary in ["/usr/bin/chromium", "/usr/bin/chromium-browser",
+                   "/usr/lib/chromium-browser/chromium-browser"]:
+        if os.path.exists(binary):
+            options.binary_location = binary
+            break
+
+    # chromedriverを自動インストール・検出
+    try:
+        service = Service(ChromeDriverManager().install())
+    except Exception:
+        # フォールバック：システムのchromedriverを使う
+        for drv in ["/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver",
+                    "/usr/lib/chromium-browser/chromedriver"]:
+            if os.path.exists(drv):
+                service = Service(drv)
+                break
+        else:
+            service = Service()
+
     return webdriver.Chrome(service=service, options=options)
 
 def wait_for(driver, by, selector, timeout=15):
