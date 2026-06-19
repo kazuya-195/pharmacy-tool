@@ -156,35 +156,33 @@ def search_and_collect(driver, keyword, status_text, debug=False):
     if debug:
         st.image(driver.get_screenshot_as_png(), caption="② キーワードで探すクリック後")
 
-    # ── keywordType を施設名称(2)に変更（SPAイベント付き）──────────
+    # ── keywordType を施設名称(2)に変更（薬局側＝最後の要素を使う）──
     try:
-        sel_el = driver.find_element(By.CSS_SELECTOR, "select[name='keywordType']")
-        # 1. Seleniumで選択
-        Select(sel_el).select_by_value("2")
-        time.sleep(0.3)
-        # 2. SPAに通知するイベントを発火
-        fire_events(driver, sel_el, ("change", "input"))
-        time.sleep(0.5)
-        if debug:
-            after_val = driver.execute_script("return arguments[0].value;", sel_el)
-            st.info(f"keywordType after: {after_val}")
+        # 医療機関・薬局の2つある → 薬局側は最後 [-1]
+        sel_els = driver.find_elements(By.CSS_SELECTOR, "select[name='keywordType']")
+        sel_el = sel_els[-1] if sel_els else None
+        if sel_el:
+            Select(sel_el).select_by_value("2")
+            time.sleep(0.3)
+            fire_events(driver, sel_el, ("change", "input"))
+            time.sleep(0.5)
+            if debug:
+                after_val = driver.execute_script("return arguments[0].value;", sel_el)
+                st.info(f"keywordType (薬局側) after: {after_val}  ← 2なら成功")
     except Exception as e:
         if debug:
             st.warning(f"keywordType選択失敗: {e}")
 
-    # ── キーワード入力（SPAイベント付き）────────────────────────────
+    # ── キーワード入力（薬局側＝最後の入力欄）─────────────────────
     input_filled = False
     kw_input = None
     try:
-        kw_input = driver.find_element(By.CSS_SELECTOR,
-            "input#keyword1, input[name='keyword'], input[id*='keyword']")
+        # id=keyword1 または name=keyword の最後の要素（薬局側）
+        candidates = driver.find_elements(By.CSS_SELECTOR,
+            "input[name='keyword'], input[id*='keyword'], input[type='text']")
+        kw_input = candidates[-1] if candidates else None
     except Exception:
-        try:
-            inputs = driver.find_elements(By.CSS_SELECTOR,
-                "input[type='text'], input:not([type='hidden'])")
-            kw_input = inputs[-1] if inputs else None
-        except Exception:
-            pass
+        pass
 
     if kw_input:
         try:
@@ -213,21 +211,24 @@ def search_and_collect(driver, keyword, status_text, debug=False):
     # ── 検索ボタン（searchBtnクラス）クリック ──────────────────────
     time.sleep(0.5)
     try:
-        # class="searchBtn" を最優先
-        btn = driver.find_element(By.CSS_SELECTOR, "button.searchBtn, input.searchBtn")
-        driver.execute_script("arguments[0].click();", btn)
-        if debug:
-            st.info("searchBtnをクリック")
-    except Exception:
-        try:
-            # フォールバック: テキストが「検索」のbuttonのみ
-            btns = [b for b in driver.find_elements(By.TAG_NAME, "button")
-                    if b.text.strip() == "検索" and b.is_displayed()]
-            if btns:
-                driver.execute_script("arguments[0].click();", btns[-1])
-        except Exception as e:
+        # searchBtnが複数ある → 薬局側は最後 [-1]
+        btns = driver.find_elements(By.CSS_SELECTOR, "button.searchBtn, input.searchBtn")
+        btn = btns[-1] if btns else None
+        if btn:
+            driver.execute_script("arguments[0].click();", btn)
             if debug:
-                st.warning(f"検索ボタン失敗: {e}")
+                st.info(f"searchBtn[-1]をクリック（全{len(btns)}個中の最後）")
+        else:
+            # フォールバック: テキストが「検索」のみのbuttonの最後
+            all_btns = [b for b in driver.find_elements(By.TAG_NAME, "button")
+                        if b.text.strip() == "検索" and b.is_displayed()]
+            if all_btns:
+                driver.execute_script("arguments[0].click();", all_btns[-1])
+                if debug:
+                    st.info(f"テキスト検索ボタン[-1]をクリック（全{len(all_btns)}個中の最後）")
+    except Exception as e:
+        if debug:
+            st.warning(f"検索ボタン失敗: {e}")
 
     time.sleep(4)
 
