@@ -144,11 +144,13 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
     if debug:
         st.image(driver.get_screenshot_as_png(), caption="② モーダル処理後")
 
-    # 全ページを巡回してリンク収集
+    # 全ページを巡回してリンク収集（最大20ページ）
     all_urls = []
     page_num = 1
+    MAX_PAGES = 20
+    consecutive_empty = 0  # 連続0件カウント
 
-    while True:
+    while page_num <= MAX_PAGES:
         # JavaScript で全リンクを取得
         js_links = driver.execute_script("""
             return Array.from(document.querySelectorAll('a')).map(l => ({
@@ -198,16 +200,34 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
                     seen.add(href)
 
         all_urls.extend(page_urls)
-        status_text.text(f"結果収集中... ページ{page_num}: {len(page_urls)}件")
+        status_text.text(f"結果収集中... ページ{page_num}: {len(page_urls)}件 / 累計{len(all_urls)}件")
 
-        # 次のページへ
+        # 0件が2回続いたら終了
+        if len(page_urls) == 0:
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                break
+        else:
+            consecutive_empty = 0
+
+        # 次のページへ（ページネーションボタンのみ）
         try:
-            nxt = [b for b in driver.find_elements(By.XPATH,
-                       "//*[normalize-space()='次へ' or normalize-space()='>>']")
-                   if b.is_displayed()]
-            if nxt:
-                driver.execute_script("arguments[0].click();", nxt[0])
+            # 数字ページネーションや「次へ」を探す
+            nxt = driver.find_elements(By.XPATH,
+                "//a[normalize-space()='次へ'] | //button[normalize-space()='次へ'] | "
+                "//a[normalize-space()='>>'] | //span[normalize-space()='次へ']/..")
+            # 表示されていて、ナビゲーションリンクでないものを選ぶ
+            valid_nxt = [b for b in nxt
+                        if b.is_displayed()
+                        and "S2300" not in (b.get_attribute("href") or "")
+                        and "S2900" not in (b.get_attribute("href") or "")]
+            if valid_nxt:
+                prev_url = driver.current_url
+                driver.execute_script("arguments[0].click();", valid_nxt[0])
                 time.sleep(PAGE_DELAY)
+                # URLが変わらなければ終了（同じページでループしている）
+                if driver.current_url == prev_url:
+                    break
                 page_num += 1
             else:
                 break
