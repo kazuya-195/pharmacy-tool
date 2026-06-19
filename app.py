@@ -10,7 +10,6 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import Select
 from selenium.webdriver.common.keys import Keys
 
 
@@ -124,7 +123,6 @@ def collect_form_debug(driver):
 
 def select_facility_name_if_exists(driver, debug=False):
     selects = driver.find_elements(By.TAG_NAME, "select")
-
     debug_rows = []
 
     for sel in selects:
@@ -133,7 +131,7 @@ def select_facility_name_if_exists(driver, debug=False):
 
         name = sel.get_attribute("name") or ""
         sel_id = sel.get_attribute("id") or ""
-        current_value = sel.get_attribute("value") or ""
+        before_value = sel.get_attribute("value") or ""
 
         try:
             options = [
@@ -144,35 +142,42 @@ def select_facility_name_if_exists(driver, debug=False):
                 for o in sel.find_elements(By.TAG_NAME, "option")
             ]
 
+            if name == "keywordType":
+                driver.execute_script("""
+                    arguments[0].value = '2';
+                    arguments[0].dispatchEvent(new Event('input', { bubbles:true }));
+                    arguments[0].dispatchEvent(new Event('change', { bubbles:true }));
+                    arguments[0].dispatchEvent(new Event('blur', { bubbles:true }));
+                """, sel)
+
+                time.sleep(1)
+
+                after_value = sel.get_attribute("value") or ""
+
+                debug_rows.append({
+                    "name": name,
+                    "id": sel_id,
+                    "before": before_value,
+                    "after": after_value,
+                    "options": " | ".join([f"{o['text']}:{o['value']}" for o in options])
+                })
+
+                return after_value == "2", debug_rows
+
             debug_rows.append({
                 "name": name,
                 "id": sel_id,
-                "current_value": current_value,
+                "before": before_value,
+                "after": sel.get_attribute("value") or "",
                 "options": " | ".join([f"{o['text']}:{o['value']}" for o in options])
             })
-
-            # ナビイのキーワード検索種別
-            if name == "keywordType":
-                for opt in options:
-                    if opt["text"] == "施設名称":
-                        Select(sel).select_by_visible_text("施設名称")
-                        time.sleep(1)
-                        return True, debug_rows
-
-                # テキスト取得がうまくいかない場合の保険
-                # CSV上では value=1 が初期値。施設名称は通常 value=2 の可能性が高い
-                try:
-                    Select(sel).select_by_value("2")
-                    time.sleep(1)
-                    return True, debug_rows
-                except Exception:
-                    pass
 
         except Exception as e:
             debug_rows.append({
                 "name": name,
                 "id": sel_id,
-                "current_value": current_value,
+                "before": before_value,
+                "after": "",
                 "options": f"ERROR: {e}"
             })
 
@@ -220,10 +225,10 @@ def fill_visible_keyword_input(driver, keyword):
                 el.clear()
                 el.send_keys(keyword)
 
-                # React/Vue系対策
                 driver.execute_script("""
                     arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
                     arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
+                    arguments[0].dispatchEvent(new Event('blur', { bubbles: true }));
                 """, el)
 
                 val = el.get_attribute("value") or ""
@@ -278,7 +283,7 @@ def extract_result_links(driver):
         "ホーム","トップ","検索","次へ","前へ","閉じる","戻る",
         "医療機関","薬局を探す","キーワード","急いで探す","じっくり探す",
         "お気に入り","都道府県","ご意見","マニュアル","リンク集","ログイン",
-        "このページの先頭へ","English"
+        "このページの先頭へ","English","日本語","簡体中文","繁體中文","한국어"
     }
 
     results = []
@@ -298,7 +303,7 @@ def extract_result_links(driver):
         if key in seen:
             continue
 
-        if href and any(x in href for x in ["S2310", "S2400", "S2500", "detail", "juminkanja"]):
+        if href and any(x in href for x in ["S2310", "S2400", "S2500", "detail"]):
             results.append((name, href))
             seen.add(key)
             continue
@@ -342,6 +347,7 @@ def search_and_collect(driver, keyword, status_text, debug=False):
         st.write(f"施設名称選択結果: {selected}")
         st.write("SELECT一覧")
         st.dataframe(select_debug, use_container_width=True)
+        st.write(select_debug)
         debug_screenshot(driver, "③-1 施設名称選択後")
 
     input_filled, target, tried = fill_visible_keyword_input(driver, keyword)
