@@ -1,3 +1,9 @@
+import subprocess, sys, os
+
+# Streamlit Cloud でPlaywrightのブラウザを自動インストール
+if not os.path.exists(os.path.expanduser("~/.cache/ms-playwright/chromium-1169")):
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+
 import streamlit as st
 import asyncio
 import pandas as pd
