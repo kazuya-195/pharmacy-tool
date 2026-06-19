@@ -1,19 +1,16 @@
-import subprocess, sys, os
-
-# Streamlit Cloud でPlaywrightのブラウザを自動インストール
-if not os.path.exists(os.path.expanduser("~/.cache/ms-playwright/chromium-1169")):
-    subprocess.run(["playwright", "install", "chromium"], check=True)
-
 import streamlit as st
-import asyncio
 import pandas as pd
 import re
-import nest_asyncio
+import time
 from io import BytesIO
 from datetime import datetime
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-
-nest_asyncio.apply()
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 # ============================================================
 # 設定
@@ -51,8 +48,28 @@ REGION_MAP = {
     "鹿児島県":"07_九州沖縄","沖縄県":"07_九州沖縄",
 }
 
-BASE_URL   = "https://www.iryou.teikyouseido.mhlw.go.jp/znk-web/juminkanja/S2300/initialize"
-TIMEOUT_MS = 20000
+BASE_URL = "https://www.iryou.teikyouseido.mhlw.go.jp/znk-web/juminkanja/S2300/initialize"
+PAGE_DELAY = 2
+DETAIL_DELAY = 1.5
+
+# ============================================================
+# Selenium ドライバー
+# ============================================================
+def get_driver():
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,800")
+    options.binary_location = "/usr/bin/chromium"
+    service = Service("/usr/bin/chromedriver")
+    return webdriver.Chrome(service=service, options=options)
+
+def wait_for(driver, by, selector, timeout=15):
+    return WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((by, selector))
+    )
 
 # ============================================================
 # スクレイピング処理
@@ -65,118 +82,137 @@ def extract_pref(address):
     m = re.search(r"(北海道|東京都|大阪府|京都府|[^\s]{2,3}県)", address)
     return m.group(1) if m else ""
 
-async def search_urls(page, keyword):
-    await page.goto(BASE_URL, timeout=TIMEOUT_MS * 2)
-    await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+def search_and_collect(driver, keyword, status_text):
+    driver.get(BASE_URL)
+    time.sleep(3)
+
+    # 薬局タブ → キーワード検索
     try:
-        await page.locator("text=薬局を探す").first.click(timeout=TIMEOUT_MS)
-        await page.wait_for_timeout(700)
-        links = await page.locator("a:has-text('キーワードで探す')").all()
-        await (links[1] if len(links) >= 2 else links[0]).click(timeout=TIMEOUT_MS)
-        await page.wait_for_timeout(800)
+        links = driver.find_elements(By.PARTIAL_LINK_TEXT, "キーワードで探す")
+        if len(links) >= 2:
+            links[1].click()
+        elif links:
+            links[0].click()
+        time.sleep(1)
     except Exception:
         pass
+
+    # 施設名称を選択
     try:
-        for sel in await page.locator("select").all():
-            opts = await sel.evaluate("el => Array.from(el.options).map(o => o.text)")
+        selects = driver.find_elements(By.TAG_NAME, "select")
+        for sel in selects:
+            opts = [o.text for o in sel.find_elements(By.TAG_NAME, "option")]
             if "施設名称" in opts:
-                await sel.select_option(label="施設名称")
+                Select(sel).select_by_visible_text("施設名称")
                 break
     except Exception:
         pass
-    try:
-        inputs = await page.locator("input[type='text']").all()
-        await inputs[0].fill(keyword)
-    except Exception:
-        return []
-    try:
-        await page.locator("button:has-text('検索')").first.click(timeout=TIMEOUT_MS)
-    except Exception:
-        await page.keyboard.press("Enter")
-    await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-    await page.wait_for_timeout(1500)
 
-    all_urls, page_num = [], 1
+    # キーワード入力
+    try:
+        inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text']")
+        if inputs:
+            inputs[0].clear()
+            inputs[0].send_keys(keyword)
+    except Exception as e:
+        return []
+
+    # 検索ボタン
+    try:
+        btns = driver.find_elements(By.XPATH, "//button[contains(text(),'検索')]")
+        if btns:
+            btns[0].click()
+        else:
+            inputs[0].submit()
+    except Exception:
+        pass
+
+    time.sleep(PAGE_DELAY)
+
+    # 全ページのURLを収集
+    all_urls = []
+    page_num = 1
     while True:
-        links = await page.locator(
-            "a[href*='S2310'], a[href*='S2400'], a[href*='detail'], table a, .facility-name a"
-        ).all()
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href*='S2310'], a[href*='S2400'], table a")
         page_urls = []
         for link in links:
             try:
-                name = re.sub(r"\s+", " ", await link.inner_text()).strip()
-                href = await link.get_attribute("href")
-                if name and href:
-                    if href.startswith("/"):
-                        href = "https://www.iryou.teikyouseido.mhlw.go.jp" + href
+                name = re.sub(r"\s+", " ", link.text).strip()
+                href = link.get_attribute("href")
+                if name and href and "javascript" not in href:
                     page_urls.append((name, href))
             except Exception:
                 continue
         all_urls.extend(page_urls)
+        status_text.text(f"🔍 検索中... ページ {page_num}：{len(page_urls)} 件発見")
+
+        # 次のページへ
         try:
-            next_btn = page.locator("a:has-text('次へ'), a.next").first
-            if not await next_btn.is_visible() or len(page_urls) == 0:
+            next_links = driver.find_elements(By.PARTIAL_LINK_TEXT, "次へ")
+            if next_links and next_links[0].is_displayed():
+                next_links[0].click()
+                time.sleep(PAGE_DELAY)
+                page_num += 1
+            else:
                 break
-            await next_btn.click(timeout=TIMEOUT_MS)
-            await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-            await page.wait_for_timeout(1500)
-            page_num += 1
         except Exception:
             break
+
     return all_urls
 
-async def fetch_detail(context, name, url):
-    store = {"施設名": name, "住所": "", "都道府県": "", "地方": "",
-             "薬剤師_常勤": "", "薬剤師_非常勤": "", "総取扱処方箋数": "", "詳細URL": url}
+def fetch_detail(driver, name, url):
+    store = {
+        "施設名": name, "住所": "", "都道府県": "", "地方": "",
+        "薬剤師_常勤": "", "薬剤師_非常勤": "", "総取扱処方箋数": "",
+        "詳細URL": url
+    }
     try:
-        p = await context.new_page()
-        await p.goto(url, timeout=TIMEOUT_MS * 2)
-        await p.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+        driver.get(url)
+        time.sleep(2)
+
+        # 「実績、結果に係る事項」タブをクリック
         try:
-            tab = p.locator("text=実績、結果に係る事項, a:has-text('実績'), button:has-text('実績')").first
-            await tab.click(timeout=TIMEOUT_MS)
-            await p.wait_for_timeout(1000)
+            tabs = driver.find_elements(By.XPATH,
+                "//*[contains(text(),'実績') and (self::a or self::button or self::span or self::li)]")
+            if tabs:
+                tabs[0].click()
+                time.sleep(1)
         except Exception:
             pass
-        txt = await p.inner_text("body")
+
+        txt = driver.find_element(By.TAG_NAME, "body").text
+
         store["薬剤師_常勤"]    = extract_val(txt, r"常勤の人数\s*[：:]\s*([\d,]+)")
         store["薬剤師_非常勤"]  = extract_val(txt, r"非常勤の人数[（(][^）)]*[）)]\s*[：:]\s*([\d,]+)")
         store["総取扱処方箋数"] = extract_val(txt, r"総取[り扱]+処方箋数\s*[：:①②]\s*([\d,]+)")
         store["住所"]           = extract_val(txt, r"所在地\s*[：:]\s*(.+?)[\n\r]")
+
         pref = extract_pref(store["住所"])
         store["都道府県"] = pref
         store["地方"]     = REGION_MAP.get(pref, "99_不明")
-        await p.close()
+
     except Exception as e:
         store["エラー"] = str(e)
     return store
 
-async def run_scrape(company_name, progress_bar, status_text):
+def run_scrape(company_name, progress_bar, status_text):
     keyword = COMPANY_MAP.get(company_name, company_name)
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-
-        status_text.text("🔍 ナビィで検索中...")
-        urls = await search_urls(page, keyword)
-
+    driver = get_driver()
+    all_stores = []
+    try:
+        urls = search_and_collect(driver, keyword, status_text)
         if not urls:
-            await browser.close()
             return []
 
-        stores = []
         for i, (name, url) in enumerate(urls):
-            status_text.text(f"📋 詳細取得中... {i+1}/{len(urls)}: {name}")
+            status_text.text(f"📋 詳細取得中 {i+1}/{len(urls)}: {name}")
             progress_bar.progress((i + 1) / len(urls))
-            store = await fetch_detail(context, name, url)
-            stores.append(store)
-            await asyncio.sleep(1.2)
-
-        await browser.close()
-    return stores
+            store = fetch_detail(driver, name, url)
+            all_stores.append(store)
+            time.sleep(DETAIL_DELAY)
+    finally:
+        driver.quit()
+    return all_stores
 
 def to_excel(stores):
     df = pd.DataFrame(stores)
@@ -193,8 +229,7 @@ def to_excel(stores):
         fill = PatternFill(fill_type="solid", fgColor="1F4E79")
         font = Font(color="FFFFFF", bold=True)
         for cell in ws[1]:
-            cell.fill = fill
-            cell.font = font
+            cell.fill = fill; cell.font = font
             cell.alignment = Alignment(horizontal="center")
         for col in ws.columns:
             w = max((len(str(c.value)) for c in col if c.value), default=10)
@@ -206,7 +241,6 @@ def to_excel(stores):
 # Streamlit UI
 # ============================================================
 st.set_page_config(page_title="薬局情報収集ツール", page_icon="💊", layout="centered")
-
 st.title("💊 薬局情報収集ツール")
 st.caption("医療情報ネット（ナビイ）から薬剤師数・処方箋数を自動収集します")
 st.divider()
@@ -215,39 +249,32 @@ company = st.text_input(
     "調べたい企業名を入力",
     placeholder="例：クオール　/　日本調剤　/　総合メディカル"
 )
-
-known = list(COMPANY_MAP.keys())
-st.caption(f"登録済み企業: {' / '.join(known)}")
+st.caption(f"登録済み企業: {' / '.join(COMPANY_MAP.keys())}")
 
 if st.button("🔍 検索開始", type="primary", disabled=not company):
     progress = st.progress(0)
     status   = st.empty()
-
     with st.spinner("収集中です。店舗数によって数分かかります..."):
         try:
-            stores = asyncio.run(run_scrape(company, progress, status))
+            stores = run_scrape(company, progress, status)
         except Exception as e:
-            st.error(f"エラーが発生しました: {e}")
+            st.error(f"エラー: {e}")
             stores = []
 
     if stores:
         progress.progress(1.0)
         status.text("✅ 完了！")
-
         buf, df = to_excel(stores)
         fname = f"{company}_薬局一覧_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-
         st.success(f"**{len(stores)} 件** を取得しました")
         st.download_button(
             label="📥 Excelをダウンロード",
-            data=buf,
-            file_name=fname,
+            data=buf, file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
-
-        st.subheader("プレビュー（地域別ソート）")
         show_cols = [c for c in ["施設名","都道府県","薬剤師_常勤","薬剤師_非常勤","総取扱処方箋数"] if c in df.columns]
+        st.subheader("プレビュー（地域別ソート）")
         st.dataframe(df[show_cols], use_container_width=True)
     else:
         st.warning("結果が取得できませんでした。企業名を確認してください。")
