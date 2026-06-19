@@ -367,46 +367,73 @@ def to_excel(stores):
     return buf, df
 
 # ============================================================
-# Streamlit UI
+# ============================================================
+# Streamlit UI（最終版）
 # ============================================================
 st.set_page_config(page_title="薬局情報収集ツール", page_icon="💊", layout="centered")
+
 st.title("💊 薬局情報収集ツール")
-st.caption("医療情報ネット（ナビイ）から薬剤師数・処方箋数を自動収集します")
+st.caption("医療情報ネット（ナビイ）から薬局の薬剤師数・処方箋数を自動収集してExcelに出力します")
 st.divider()
 
-company = st.text_input("① 企業名（ファイル名に使われます）",
-    placeholder="例：株式会社裕生堂、クオール")
-keyword = st.text_input("② ナビィでの検索ワード（店舗名のブランド名）",
-    placeholder="例：裕生堂薬局、クオール薬局、日本調剤")
-st.caption("💡 ①と②が同じでOKな場合が多いです。ナビィで実際に検索して確認できます。")
+col1, col2 = st.columns(2)
+with col1:
+    company = st.text_input("① 企業名",
+        placeholder="例：株式会社裕生堂")
+with col2:
+    keyword = st.text_input("② ナビィ検索ワード",
+        placeholder="例：裕生堂薬局")
 
-debug_mode = st.checkbox("🔧 デバッグモード", value=False)
+st.caption("💡 ②はナビィで薬局名として表示されているブランド名を入力してください。①と同じでOKな場合も多いです。")
+
+with st.expander("🔧 開発者向けオプション"):
+    debug_mode = st.checkbox("デバッグモード（ブラウザの動作を画像で確認）", value=False)
+
 st.divider()
 
-if st.button("🔍 検索開始", type="primary", disabled=not (company and keyword)):
+ready = bool(company and keyword)
+if st.button("🔍 収集開始", type="primary", disabled=not ready, use_container_width=True):
     progress = st.progress(0)
     status   = st.empty()
-    with st.spinner("収集中です..."):
+
+    with st.spinner(f"「{keyword}」を収集中です。店舗数によって数分かかります..."):
         try:
             stores = run(company, keyword, progress, status, debug_mode)
         except Exception as e:
-            st.error(f"エラー: {e}")
+            st.error(f"エラーが発生しました: {e}")
             stores = []
 
     if stores:
         progress.progress(1.0)
-        status.text("✅ 完了！")
+        status.empty()
+
         buf, df = to_excel(stores)
         fname = f"{company}_薬局一覧_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        st.success(f"**{len(stores)} 件** を取得しました")
-        st.download_button(label="📥 Excelをダウンロード", data=buf, file_name=fname,
+
+        st.success(f"✅  {len(stores)} 件を取得しました")
+
+        st.download_button(
+            label="📥 Excelをダウンロード",
+            data=buf,
+            file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary")
-        show_cols = [c for c in ["施設名","都道府県","薬剤師_常勤","薬剤師_非常勤","総取扱処方箋数"] if c in df.columns]
+            type="primary",
+            use_container_width=True,
+        )
+
         st.subheader("プレビュー（地域別ソート）")
-        st.dataframe(df[show_cols], use_container_width=True)
+        show_cols = [c for c in
+            ["施設名","都道府県","住所","薬剤師_常勤","薬剤師_非常勤","総取扱処方箋数"]
+            if c in df.columns]
+        st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+
     else:
-        st.warning("結果が取得できませんでした。検索ワードを確認してください。")
+        st.warning(
+            "結果が取得できませんでした。\n\n"
+            "② のナビィ検索ワードを確認してください。"
+            "ナビィ（https://www.iryou.teikyouseido.mhlw.go.jp）で実際に検索して、"
+            "出てくる薬局名のブランド名を入力してください。"
+        )
 
 st.divider()
-st.caption("※ データは医療情報ネット（ナビイ）/ 厚生労働省より取得")
+st.caption("データ出典：医療情報ネット（ナビイ）/ 厚生労働省・都道府県")
