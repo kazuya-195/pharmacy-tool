@@ -183,7 +183,8 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
         page_urls = []
         seen = set()
         SKIP = {"ホーム","トップ","次へ","前へ","閉じる","戻る","条件を絞り込む",
-                "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者"}
+                "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者",
+                "医療機関を探す","薬局を探す","キーワードで探す"}
         SKIP_PATTERNS = ["window", "オブジェクト", "//", "function", "undefined",
                          "null", "Copyright", "javascript", "Script"]
 
@@ -198,8 +199,9 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
                         and "javascript" not in href
                         and href not in seen
                         and name not in SKIP
-                        and any(p in href for p in ["S2410","S2420","S2430","S2440",
+                        and any(p in href for p in ["S2430","S2420","S2440",
                                                      "S2450","S2460","detail","yakkyoku"])
+                        and "S2410/initialize" not in href
                         and "iryou.teikyouseido" in href):
                     page_urls.append((name, href))
                     seen.add(href)
@@ -258,34 +260,40 @@ def fetch_detail(driver, name, url):
              "詳細URL": url}
     try:
         driver.get(url)
-        time.sleep(3)
+        time.sleep(5)  # ページ描画を待つ
 
-        # まず基本情報から住所を取得
+        # 基本情報から住所を先に取得
         txt = driver.find_element(By.TAG_NAME, "body").text
         store["住所"] = extract_val(txt, r"所在地\s*[：:]\s*(.+?)[\n\r]")
 
-        # 「実績、結果に係る事項」タブをクリック（複数パターンを試みる）
-        for xpath in [
-            "//*[contains(text(),'実績、結果')]",
-            "//*[contains(text(),'実績・結果')]",
-            "//*[contains(text(),'実績')]",
-        ]:
-            try:
-                tabs = driver.find_elements(By.XPATH, xpath)
-                visible = [t for t in tabs if t.is_displayed()]
-                if visible:
-                    driver.execute_script("arguments[0].click();", visible[0])
-                    time.sleep(2)
-                    break
-            except Exception:
-                pass
+        # タブをすべて取得して「実績」を含むものをクリック
+        clicked = False
+        try:
+            all_tabs = driver.find_elements(By.XPATH,
+                "//*[@role='tab' or self::li or self::a or self::button]"
+                "[contains(text(),'実績')]")
+            if not all_tabs:
+                all_tabs = driver.find_elements(By.XPATH,
+                    "//*[contains(text(),'実績')]")
+            for tab in all_tabs:
+                try:
+                    if tab.is_displayed():
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView(true); arguments[0].click();", tab)
+                        time.sleep(3)  # タブ描画を待つ
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
-        # タブクリック後に本文を再取得
+        # クリック後のテキストを再取得
         txt = driver.find_element(By.TAG_NAME, "body").text
 
-        store["薬剤師_常勤"]    = extract_val(txt, r"常勤の人数\s*[：:]\s*([\d,]+)")
-        store["薬剤師_非常勤"]  = extract_val(txt, r"非常勤の人数[（(][^）)]*[）)]\s*[：:]\s*([\d,]+)")
-        store["総取扱処方箋数"] = extract_val(txt, r"総取[り扱]+処方箋数\s*[：:①②]\s*([\d,]+)")
+        store["薬剤師_常勤"]    = extract_val(txt, r"常勤の人数[^\d]*([\d,]+)")
+        store["薬剤師_非常勤"]  = extract_val(txt, r"非常勤の人数[^）]*[）)][^\d]*([\d,]+)")
+        store["総取扱処方箋数"] = extract_val(txt, r"総取扱処方箋数[^\d]*([\d,]+)")
 
         if not store["住所"]:
             store["住所"] = extract_val(txt, r"所在地\s*[：:]\s*(.+?)[\n\r]")
