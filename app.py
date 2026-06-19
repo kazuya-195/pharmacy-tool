@@ -42,21 +42,48 @@ PAGE_DELAY = 2.5
 DETAIL_DELAY = 1.5
 
 # ============================================================
-# Step1: APIで検索セッションIDを取得
+# Step1: Seleniumのセッションを使ってAPIで検索IDを取得
 # ============================================================
-def get_session_id(keyword: str) -> str | None:
+def get_session_id_with_driver(driver, keyword: str, debug: bool) -> str | None:
+    """
+    ① Seleniumでナビィのトップページを開く（セッション確立）
+    ② そのクッキーをrequestsに渡してAPIを叩く
+    ③ セッションIDを返す
+    """
+    base = "https://www.iryou.teikyouseido.mhlw.go.jp"
+
+    # ナビィのトップを開いてセッションを確立
+    driver.get(f"{base}/znk-web/juminkanja/S2300/initialize")
+    time.sleep(4)
+
+    if debug:
+        st.image(driver.get_screenshot_as_png(), caption="① トップページ（セッション確立）")
+
+    # Seleniumのクッキーをrequestsセッションに移植
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": driver.execute_script("return navigator.userAgent;"),
+        "Referer": f"{base}/znk-web/juminkanja/S2300/initialize",
+    })
+    for cookie in driver.get_cookies():
+        session.cookies.set(cookie["name"], cookie["value"],
+                            domain=cookie.get("domain",""))
+
+    # 同じセッションでAPIを叩く
     params = {
         "XCHARSET": "utf-8",
         "XPARAM": "keyword",
-        "iyakuKbn": "2",      # 薬局
+        "iyakuKbn": "2",
         "lang": "ja",
-        "keywordType": "2",   # 施設名称
+        "keywordType": "2",
         "keyword": keyword,
     }
     try:
-        r = requests.get(SEARCH_API, params=params, timeout=15)
+        r = session.get(SEARCH_API, params=params, timeout=15)
         data = r.json()
         session_id = data.get("result", {}).get("id")
+        if debug:
+            st.info(f"APIレスポンス: {data}")
         return session_id
     except Exception as e:
         st.error(f"API呼び出し失敗: {e}")
@@ -232,20 +259,20 @@ def fetch_detail(driver, name, url):
 # メイン処理
 # ============================================================
 def run(company, keyword, progress_bar, status_text, debug):
-    # Step1: APIで検索
-    status_text.text("🔍 ナビィAPIで検索中...")
-    session_id = get_session_id(keyword)
-    if not session_id:
-        return []
-
-    if debug:
-        st.info(f"セッションID取得: {session_id}")
-
-    # Step2: Seleniumで結果ページを開いてリンク収集
-    status_text.text("📋 検索結果を取得中...")
+    # Step1: Seleniumでセッション確立 → APIで検索ID取得
+    status_text.text("🔍 ナビィに接続してセッションを確立中...")
     driver = get_driver()
     all_stores = []
     try:
+        session_id = get_session_id_with_driver(driver, keyword, debug)
+        if not session_id:
+            return []
+
+        if debug:
+            st.info(f"セッションID取得: {session_id}")
+
+        # Step2: 結果ページを開いてリンク収集
+        status_text.text("📋 検索結果を取得中...")
         urls = collect_detail_urls(driver, session_id, status_text, debug)
 
         if not urls:
