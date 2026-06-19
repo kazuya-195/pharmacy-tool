@@ -1,4 +1,5 @@
 import streamlit as st
+import requests
 import pandas as pd
 import re
 import time
@@ -10,13 +11,15 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 # ============================================================
 # 設定
 # ============================================================
+SEARCH_API = "https://www.iryou.teikyouseido.mhlw.go.jp/znk-web/juminkanja/S2300/yakkyokuSearch"
+RESULTS_BASE = "https://www.iryou.teikyouseido.mhlw.go.jp/znk-web/juminkanja/S2400/initialize?id="
+
 REGION_MAP = {
     "北海道":"01_北海道",
     "青森県":"02_東北","岩手県":"02_東北","宮城県":"02_東北",
@@ -35,16 +38,34 @@ REGION_MAP = {
     "熊本県":"07_九州沖縄","大分県":"07_九州沖縄","宮崎県":"07_九州沖縄",
     "鹿児島県":"07_九州沖縄","沖縄県":"07_九州沖縄",
 }
-
-BASE_URL = "https://www.iryou.teikyouseido.mhlw.go.jp/znk-web/juminkanja/S2300/initialize"
-PAGE_DELAY = 2
+PAGE_DELAY = 2.5
 DETAIL_DELAY = 1.5
+
+# ============================================================
+# Step1: APIで検索セッションIDを取得
+# ============================================================
+def get_session_id(keyword: str) -> str | None:
+    params = {
+        "XCHARSET": "utf-8",
+        "XPARAM": "keyword",
+        "iyakuKbn": "2",      # 薬局
+        "lang": "ja",
+        "keywordType": "2",   # 施設名称
+        "keyword": keyword,
+    }
+    try:
+        r = requests.get(SEARCH_API, params=params, timeout=15)
+        data = r.json()
+        session_id = data.get("result", {}).get("id")
+        return session_id
+    except Exception as e:
+        st.error(f"API呼び出し失敗: {e}")
+        return None
 
 # ============================================================
 # Selenium ドライバー
 # ============================================================
 def _find_bin(candidates):
-    """システムにインストールされているバイナリのパスを返す"""
     for name in candidates:
         try:
             path = subprocess.check_output(["which", name], text=True).strip()
@@ -61,273 +82,104 @@ def get_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,800")
-
-    # Chromium本体を自動検出
-    chromium = _find_bin(["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"])
+    chromium = _find_bin(["chromium", "chromium-browser", "google-chrome-stable"])
     if chromium:
         options.binary_location = chromium
-
-    # ChromeDriverを自動検出
-    chromedriver = _find_bin(["chromedriver", "chromium-chromedriver", "chromium.chromedriver"])
+    chromedriver = _find_bin(["chromedriver", "chromium-chromedriver"])
     service = Service(chromedriver) if chromedriver else Service()
-
     return webdriver.Chrome(service=service, options=options)
 
-def wait_for(driver, by, selector, timeout=15):
-    return WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((by, selector))
-    )
-
 # ============================================================
-# スクレイピング処理
+# Step2: 結果ページから店舗リンクを収集
 # ============================================================
-def extract_val(text, pattern):
-    m = re.search(pattern, text, re.DOTALL)
-    return m.group(1).strip() if m else ""
-
-def extract_pref(address):
-    m = re.search(r"(北海道|東京都|大阪府|京都府|[^\s]{2,3}県)", address)
-    return m.group(1) if m else ""
-
-def fire_events(driver, element, events=("input","change")):
-    """SPA(Vue/React等)に変更を認識させるためのイベント発火"""
-    for evt in events:
-        driver.execute_script(f"""
-            arguments[0].dispatchEvent(new Event('{evt}', {{bubbles:true}}));
-        """, element)
-
-def get_popup_text(driver):
-    """エラーポップアップのテキストを取得"""
-    # ブラウザalert
-    try:
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC2
-        WebDriverWait(driver, 2).until(EC.alert_is_present())
-        alert = driver.switch_to.alert
-        txt = alert.text
-        alert.accept()
-        return f"[alert] {txt}"
-    except Exception:
-        pass
-    # カスタムモーダル
-    for sel in [".modal", ".dialog", ".popup", ".error", "[role='dialog']",
-                "[class*='modal']", "[class*='error']", "[class*='alert']"]:
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, sel)
-            if el.is_displayed():
-                return f"[modal:{sel}] {el.text[:200]}"
-        except Exception:
-            pass
-    return ""
-
-def search_and_collect(driver, keyword, status_text, debug=False):
-    driver.get(BASE_URL)
-    time.sleep(5)
+def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> list:
+    results_url = RESULTS_BASE + session_id
+    driver.get(results_url)
+    time.sleep(PAGE_DELAY)
 
     if debug:
-        st.image(driver.get_screenshot_as_png(), caption="① トップページ読み込み後")
+        st.image(driver.get_screenshot_as_png(), caption="① 結果ページ（直接アクセス）")
 
-    # ── 薬局タブをクリック ───────────────────────────────────────
-    try:
-        tabs = driver.find_elements(By.CSS_SELECTOR, "li, a, button, div")
-        yakkyoku_tab = None
-        for el in tabs:
-            if el.text.strip() in ("薬局", "薬局を探す") and el.is_displayed():
-                yakkyoku_tab = el
-                break
-        if yakkyoku_tab:
-            driver.execute_script("arguments[0].click();", yakkyoku_tab)
-            time.sleep(1.5)
-    except Exception:
-        pass
-
-    # ── キーワードで探すクリック ─────────────────────────────────
-    try:
-        kw_links = driver.find_elements(By.PARTIAL_LINK_TEXT, "キーワードで探す")
-        # 薬局側(後半)のリンクを選択
-        target_link = kw_links[-1] if kw_links else None
-        if target_link:
-            driver.execute_script("arguments[0].click();", target_link)
-            time.sleep(2)
-    except Exception as e:
-        if debug:
-            st.warning(f"キーワードリンク失敗: {e}")
-
-    if debug:
-        st.image(driver.get_screenshot_as_png(), caption="② キーワードで探すクリック後")
-
-    # ── keywordType を施設名称(2)に変更（薬局側＝最後の要素を使う）──
-    try:
-        # 医療機関・薬局の2つある → 薬局側は最後 [-1]
-        sel_els = driver.find_elements(By.CSS_SELECTOR, "select[name='keywordType']")
-        sel_el = sel_els[-1] if sel_els else None
-        if sel_el:
-            Select(sel_el).select_by_value("2")
-            time.sleep(0.3)
-            fire_events(driver, sel_el, ("change", "input"))
-            time.sleep(0.5)
-            if debug:
-                after_val = driver.execute_script("return arguments[0].value;", sel_el)
-                st.info(f"keywordType (薬局側) after: {after_val}  ← 2なら成功")
-    except Exception as e:
-        if debug:
-            st.warning(f"keywordType選択失敗: {e}")
-
-    # ── キーワード入力（薬局側＝最後の入力欄）─────────────────────
-    input_filled = False
-    kw_input = None
-    try:
-        # id=keyword1 または name=keyword の最後の要素（薬局側）
-        candidates = driver.find_elements(By.CSS_SELECTOR,
-            "input[name='keyword'], input[id*='keyword'], input[type='text']")
-        kw_input = candidates[-1] if candidates else None
-    except Exception:
-        pass
-
-    if kw_input:
+    # モーダルを閉じる
+    for sel in ["button.modalClose", "[class*='modal'] button", "button"]:
         try:
-            # 1. JavaScriptで直接値をセット
-            driver.execute_script("arguments[0].value = arguments[1];", kw_input, keyword)
-            # 2. SPAに通知
-            fire_events(driver, kw_input, ("focus", "input", "keyup", "change"))
-            time.sleep(0.5)
-            # 3. 実際の値を確認
-            actual_val = driver.execute_script("return arguments[0].value;", kw_input)
-            input_filled = (actual_val == keyword)
-            if debug:
-                st.info(f"keyword input actual value: '{actual_val}' (OK={input_filled})")
-        except Exception as e:
-            if debug:
-                st.warning(f"キーワード入力失敗: {e}")
-
-    if debug:
-        st.image(driver.get_screenshot_as_png(), caption="③ キーワード入力後")
-
-    if not input_filled:
-        if debug:
-            st.error("⚠ キーワード入力に失敗しました")
-        return []
-
-    # ── 検索ボタン（searchBtnクラス）クリック ──────────────────────
-    time.sleep(0.5)
-    try:
-        # searchBtnが複数ある → 薬局側は最後 [-1]
-        btns = driver.find_elements(By.CSS_SELECTOR, "button.searchBtn, input.searchBtn")
-        btn = btns[-1] if btns else None
-        if btn:
-            driver.execute_script("arguments[0].click();", btn)
-            if debug:
-                st.info(f"searchBtn[-1]をクリック（全{len(btns)}個中の最後）")
-        else:
-            # フォールバック: テキストが「検索」のみのbuttonの最後
-            all_btns = [b for b in driver.find_elements(By.TAG_NAME, "button")
-                        if b.text.strip() == "検索" and b.is_displayed()]
-            if all_btns:
-                driver.execute_script("arguments[0].click();", all_btns[-1])
-                if debug:
-                    st.info(f"テキスト検索ボタン[-1]をクリック（全{len(all_btns)}個中の最後）")
-    except Exception as e:
-        if debug:
-            st.warning(f"検索ボタン失敗: {e}")
-
-    time.sleep(4)
-
-    # ── モーダル/ポップアップを閉じる ────────────────────────────────
-    popup = get_popup_text(driver)
-    if popup and debug:
-        st.info(f"モーダル検出: {popup}")
-
-    # 「閉じる」「OK」「×」ボタンを探してクリック
-    closed = False
-    for close_sel in [
-        "button.modalClose", ".modal .close", "[class*='modal'] .close",
-        "button:has-text('閉じる')", ".modal button", "[class*='modal'] button",
-    ]:
-        try:
-            btns = driver.find_elements(By.CSS_SELECTOR, close_sel)
+            btns = driver.find_elements(By.CSS_SELECTOR, sel)
             for b in btns:
-                if b.is_displayed() and b.text.strip() in ("閉じる", "×", "OK", "close", ""):
-                    driver.execute_script("arguments[0].click();", b)
-                    closed = True
-                    time.sleep(1)
-                    break
-            if closed:
-                break
-        except Exception:
-            pass
-
-    if not closed:
-        # テキストで「閉じる」ボタンを探す
-        try:
-            btns = driver.find_elements(By.XPATH,
-                "//button[normalize-space()='閉じる' or normalize-space()='OK' or normalize-space()='×']")
-            for b in btns:
-                if b.is_displayed():
+                if b.is_displayed() and b.text.strip() in ("閉じる", "OK", "×"):
                     driver.execute_script("arguments[0].click();", b)
                     time.sleep(1)
                     break
         except Exception:
             pass
 
-    if debug and closed:
-        st.info("モーダルを閉じました")
+    time.sleep(1)
 
     if debug:
-        st.image(driver.get_screenshot_as_png(), caption="④ 検索後（ポップアップ処理済み）")
-        # 全リンクを表示
-        js_links = driver.execute_script("""
-            return Array.from(document.querySelectorAll('a')).map(l => ({
-                text: (l.innerText || '').trim().substring(0, 50),
-                href: l.href || ''
-            })).filter(l => l.text.length > 1);
-        """)
-        st.write(f"ページ内リンク数: {len(js_links)}")
-        st.dataframe({"テキスト": [l['text'] for l in js_links[:40]],
-                      "URL": [l['href'][:80] for l in js_links[:40]]})
+        st.image(driver.get_screenshot_as_png(), caption="② モーダル処理後")
 
-    # ── リンク収集 ──────────────────────────────────────────────────
+    # 全ページを巡回してリンク収集
     all_urls = []
     page_num = 1
-    SKIP = {"ホーム","トップ","検索","次へ","前へ","閉じる","戻る",
-            "医療機関","薬局を探す","キーワード","急いで探す","じっくり探す",
-            "お気に入り","都道府県","ご意見","マニュアル","リンク集","ログイン"}
 
     while True:
+        # JavaScript で全リンクを取得
         js_links = driver.execute_script("""
             return Array.from(document.querySelectorAll('a')).map(l => ({
                 text: (l.innerText || l.textContent || '').trim(),
                 href: l.href || ''
             }));
         """)
-        page_urls, seen = [], set()
-        for item in js_links:
-            name = re.sub(r"\s+", " ", item.get("text","")).strip()
-            href = item.get("href","")
-            # 薬局詳細ページのURL判定：S2300以外のSコードを含むページ
-            is_detail = (
-                any(p in href for p in ["S2310","S2400","S2500","S2600","kanja","detail"])
-                or (
-                    "iryou.teikyouseido" in href
-                    and "S2300" not in href
-                    and "initialize" not in href
-                    and "juminkanja" in href
-                )
-            )
-            if (name and href and len(name) >= 3
-                and "javascript" not in href
-                and href not in seen
-                and is_detail
-                and name not in SKIP):
-                page_urls.append((name, href))
-                seen.add(href)
+
+        # 結果アイテムの要素も確認（liやtr）
+        result_els = driver.execute_script("""
+            var items = document.querySelectorAll(
+                'ul li a, .searchResult a, .resultList a, table tbody tr td a, .list-item a'
+            );
+            return Array.from(items).map(a => ({
+                text: (a.innerText || '').trim(),
+                href: a.href || ''
+            }));
+        """)
+
+        if debug:
+            st.write(f"ページ{page_num}: 全リンク={len(js_links)}件, result要素={len(result_els)}件")
+            # 全リンクのうち長いテキストを持つものを表示
+            meaningful = [l for l in js_links if len(l.get('text','')) > 4
+                         and 'javascript' not in l.get('href','')
+                         and l.get('href','')]
+            st.dataframe({"テキスト": [l['text'][:40] for l in meaningful[:30]],
+                          "URL": [l['href'][:80] for l in meaningful[:30]]})
+
+        # 薬局詳細ページのリンクを抽出
+        page_urls = []
+        seen = set()
+        SKIP = {"ホーム","トップ","次へ","前へ","閉じる","戻る","条件を絞り込む",
+                "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者"}
+
+        for link_list in [result_els, js_links]:
+            for item in link_list:
+                name = re.sub(r"\s+", " ", item.get("text","")).strip()
+                href = item.get("href","")
+                if (name and href and len(name) >= 3
+                        and "javascript" not in href
+                        and href not in seen
+                        and name not in SKIP
+                        and any(p in href for p in ["S2410","S2420","S2430","S2440",
+                                                     "S2450","S2460","detail","yakkyoku"])
+                        and "iryou.teikyouseido" in href):
+                    page_urls.append((name, href))
+                    seen.add(href)
 
         all_urls.extend(page_urls)
-        status_text.text(f"検索中... ページ {page_num}: {len(page_urls)} 件")
+        status_text.text(f"結果収集中... ページ{page_num}: {len(page_urls)}件")
 
+        # 次のページへ
         try:
-            nxt = driver.find_elements(By.PARTIAL_LINK_TEXT, "次へ")
-            if nxt and nxt[0].is_displayed():
-                nxt[0].click()
+            nxt = [b for b in driver.find_elements(By.XPATH,
+                       "//*[normalize-space()='次へ' or normalize-space()='>>']")
+                   if b.is_displayed()]
+            if nxt:
+                driver.execute_script("arguments[0].click();", nxt[0])
                 time.sleep(PAGE_DELAY)
                 page_num += 1
             else:
@@ -337,70 +189,73 @@ def search_and_collect(driver, keyword, status_text, debug=False):
 
     return all_urls
 
+# ============================================================
+# Step3: 各店舗の詳細ページからデータ取得
+# ============================================================
+def extract_val(text, pattern):
+    m = re.search(pattern, text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+def extract_pref(address):
+    m = re.search(r"(北海道|東京都|大阪府|京都府|[^\s]{2,3}県)", address)
+    return m.group(1) if m else ""
 
 def fetch_detail(driver, name, url):
-    store = {
-        "施設名": name, "住所": "", "都道府県": "", "地方": "",
-        "薬剤師_常勤": "", "薬剤師_非常勤": "", "総取扱処方箋数": "",
-        "詳細URL": url
-    }
+    store = {"施設名": name, "住所": "", "都道府県": "", "地方": "",
+             "薬剤師_常勤": "", "薬剤師_非常勤": "", "総取扱処方箋数": "",
+             "詳細URL": url}
     try:
         driver.get(url)
         time.sleep(2)
-
-        # 「実績、結果に係る事項」タブをクリック
+        # 「実績、結果に係る事項」タブ
         try:
             tabs = driver.find_elements(By.XPATH,
                 "//*[contains(text(),'実績') and (self::a or self::button or self::span or self::li)]")
             if tabs:
-                tabs[0].click()
+                driver.execute_script("arguments[0].click();", tabs[0])
                 time.sleep(1)
         except Exception:
             pass
-
         txt = driver.find_element(By.TAG_NAME, "body").text
-
         store["薬剤師_常勤"]    = extract_val(txt, r"常勤の人数\s*[：:]\s*([\d,]+)")
         store["薬剤師_非常勤"]  = extract_val(txt, r"非常勤の人数[（(][^）)]*[）)]\s*[：:]\s*([\d,]+)")
         store["総取扱処方箋数"] = extract_val(txt, r"総取[り扱]+処方箋数\s*[：:①②]\s*([\d,]+)")
         store["住所"]           = extract_val(txt, r"所在地\s*[：:]\s*(.+?)[\n\r]")
-
         pref = extract_pref(store["住所"])
         store["都道府県"] = pref
         store["地方"]     = REGION_MAP.get(pref, "99_不明")
-
     except Exception as e:
         store["エラー"] = str(e)
     return store
 
-def run_scrape_with_keyword(company_name, keyword, progress_bar, status_text, debug=False):
+# ============================================================
+# メイン処理
+# ============================================================
+def run(company, keyword, progress_bar, status_text, debug):
+    # Step1: APIで検索
+    status_text.text("🔍 ナビィAPIで検索中...")
+    session_id = get_session_id(keyword)
+    if not session_id:
+        return []
+
+    if debug:
+        st.info(f"セッションID取得: {session_id}")
+
+    # Step2: Seleniumで結果ページを開いてリンク収集
+    status_text.text("📋 検索結果を取得中...")
     driver = get_driver()
     all_stores = []
     try:
-        urls = search_and_collect(driver, keyword, status_text, debug=debug)
-        if not urls:
-            return []
-        for i, (name, url) in enumerate(urls):
-            status_text.text(f"📋 詳細取得中 {i+1}/{len(urls)}: {name}")
-            progress_bar.progress((i + 1) / len(urls))
-            store = fetch_detail(driver, name, url)
-            all_stores.append(store)
-            time.sleep(DETAIL_DELAY)
-    finally:
-        driver.quit()
-    return all_stores
+        urls = collect_detail_urls(driver, session_id, status_text, debug)
 
-    keyword = COMPANY_MAP.get(company_name, company_name)
-    driver = get_driver()
-    all_stores = []
-    try:
-        urls = search_and_collect(driver, keyword, status_text)
         if not urls:
+            st.warning("詳細ページのリンクが見つかりませんでした。デバッグモードで確認してください。")
             return []
 
+        # Step3: 各詳細ページからデータ取得
         for i, (name, url) in enumerate(urls):
-            status_text.text(f"📋 詳細取得中 {i+1}/{len(urls)}: {name}")
-            progress_bar.progress((i + 1) / len(urls))
+            status_text.text(f"📊 詳細取得中 {i+1}/{len(urls)}: {name}")
+            progress_bar.progress((i+1)/len(urls))
             store = fetch_detail(driver, name, url)
             all_stores.append(store)
             time.sleep(DETAIL_DELAY)
@@ -427,11 +282,10 @@ def to_excel(stores):
             cell.alignment = Alignment(horizontal="center")
         for col in ws.columns:
             w = max((len(str(c.value)) for c in col if c.value), default=10)
-            ws.column_dimensions[col[0].column_letter].width = min(w + 2, 60)
+            ws.column_dimensions[col[0].column_letter].width = min(w+2, 60)
     buf.seek(0)
     return buf, df
 
-# ============================================================
 # ============================================================
 # Streamlit UI
 # ============================================================
@@ -440,30 +294,23 @@ st.title("💊 薬局情報収集ツール")
 st.caption("医療情報ネット（ナビイ）から薬剤師数・処方箋数を自動収集します")
 st.divider()
 
-company = st.text_input(
-    "① 企業名（ファイル名などに使われます）",
-    placeholder="例：総合メディカル、クオール、日本調剤"
-)
+company = st.text_input("① 企業名（ファイル名に使われます）",
+    placeholder="例：株式会社裕生堂、クオール")
+keyword = st.text_input("② ナビィでの検索ワード（店舗名のブランド名）",
+    placeholder="例：裕生堂薬局、クオール薬局、日本調剤")
+st.caption("💡 ①と②が同じでOKな場合が多いです。ナビィで実際に検索して確認できます。")
 
-keyword = st.text_input(
-    "② ナビィでの検索ワード（店舗名に使われているブランド名）",
-    placeholder="例：そうごう薬局、クオール薬局、日本調剤"
-)
-st.caption("💡 ①と②が同じ場合はどちらも同じ名前でOKです。ナビイで薬局名を検索して確認できます。")
-
-debug_mode = st.checkbox("🔧 デバッグモード（ブラウザの動作を画像で確認）", value=False)
-
+debug_mode = st.checkbox("🔧 デバッグモード", value=False)
 st.divider()
 
-can_search = bool(company and keyword)
-if st.button("🔍 検索開始", type="primary", disabled=not can_search):
+if st.button("🔍 検索開始", type="primary", disabled=not (company and keyword)):
     progress = st.progress(0)
     status   = st.empty()
-    with st.spinner(f"「{keyword}」で検索中です。店舗数によって数分かかります..."):
+    with st.spinner("収集中です..."):
         try:
-            stores = run_scrape_with_keyword(company, keyword, progress, status, debug=debug_mode)
+            stores = run(company, keyword, progress, status, debug_mode)
         except Exception as e:
-            st.error(f"エラーが発生しました: {e}")
+            st.error(f"エラー: {e}")
             stores = []
 
     if stores:
@@ -472,20 +319,14 @@ if st.button("🔍 検索開始", type="primary", disabled=not can_search):
         buf, df = to_excel(stores)
         fname = f"{company}_薬局一覧_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.success(f"**{len(stores)} 件** を取得しました")
-        st.download_button(
-            label="📥 Excelをダウンロード",
-            data=buf, file_name=fname,
+        st.download_button(label="📥 Excelをダウンロード", data=buf, file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"
-        )
+            type="primary")
         show_cols = [c for c in ["施設名","都道府県","薬剤師_常勤","薬剤師_非常勤","総取扱処方箋数"] if c in df.columns]
         st.subheader("プレビュー（地域別ソート）")
         st.dataframe(df[show_cols], use_container_width=True)
     else:
-        st.warning(f"「{keyword}」で検索しましたが結果が取得できませんでした。\n\n検索ワードを変えて再試行してください。")
-
-st.divider()
-st.caption("※ データは医療情報ネット（ナビイ）/ 厚生労働省より取得")
+        st.warning("結果が取得できませんでした。検索ワードを確認してください。")
 
 st.divider()
 st.caption("※ データは医療情報ネット（ナビイ）/ 厚生労働省より取得")
