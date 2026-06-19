@@ -121,6 +121,27 @@ def collect_form_debug(driver):
     """)
 
 
+def collect_button_debug(driver):
+    return driver.execute_script("""
+        return Array.from(
+            document.querySelectorAll('button, input[type=button], input[type=submit], a')
+        ).map((b, idx) => ({
+            idx: idx,
+            tag: b.tagName,
+            type: b.type || '',
+            text: (b.innerText || b.value || b.textContent || '').trim().substring(0, 80),
+            name: b.name || '',
+            id: b.id || '',
+            className: b.className || '',
+            href: b.href || '',
+            onclick: b.getAttribute('onclick') || '',
+            disabled: b.disabled || false,
+            displayed: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+            value: b.value || ''
+        }));
+    """)
+
+
 def select_facility_name_if_exists(driver, debug=False):
     selects = driver.find_elements(By.TAG_NAME, "select")
     debug_rows = []
@@ -241,6 +262,7 @@ def fill_visible_keyword_input(driver, keyword):
 
 
 def click_search_button(driver, target_input=None):
+    # 画面上の「検索」ボタン候補を下方向から探す
     button_xpaths = [
         "//button[contains(normalize-space(), '検索')]",
         "//input[@type='submit' and contains(@value, '検索')]",
@@ -248,17 +270,31 @@ def click_search_button(driver, target_input=None):
         "//*[self::a or self::button or self::span or self::div][contains(normalize-space(), '検索')]",
     ]
 
+    candidates = []
+
     for xp in button_xpaths:
         buttons = driver.find_elements(By.XPATH, xp)
         for b in buttons:
             if is_visible(b):
                 try:
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
-                    time.sleep(0.2)
-                    driver.execute_script("arguments[0].click();", b)
-                    return True
+                    loc = b.location
+                    candidates.append((loc.get("y", 0), b))
                 except Exception:
-                    continue
+                    candidates.append((0, b))
+
+    # 下にある検索ボタンを優先
+    candidates = sorted(candidates, key=lambda x: x[0], reverse=True)
+
+    for _, b in candidates:
+        try:
+            if b.get_attribute("disabled"):
+                continue
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+            time.sleep(0.3)
+            driver.execute_script("arguments[0].click();", b)
+            return True
+        except Exception:
+            continue
 
     if target_input:
         try:
@@ -363,12 +399,22 @@ def search_and_collect(driver, keyword, status_text, debug=False):
             st.error("表示中のキーワード入力欄が見つからない、または入力値が反映されませんでした。")
         return []
 
+    if debug:
+        before_buttons = collect_button_debug(driver)
+        st.write("検索前 BUTTON一覧")
+        st.dataframe(before_buttons, use_container_width=True)
+
     clicked_search = click_search_button(driver, target)
     time.sleep(6)
 
     if debug:
         st.write(f"検索ボタンクリック: {clicked_search}")
         debug_screenshot(driver, "④ 検索結果ページ")
+
+        after_buttons = collect_button_debug(driver)
+        st.write("検索後 BUTTON一覧")
+        st.dataframe(after_buttons, use_container_width=True)
+
         js_links = driver.execute_script("""
             return Array.from(document.querySelectorAll('a')).map((l, idx) => ({
                 idx: idx,
@@ -380,9 +426,12 @@ def search_and_collect(driver, keyword, status_text, debug=False):
         st.write(f"ページ内リンク数: {len(js_links)}")
         st.dataframe(js_links[:100], use_container_width=True)
 
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        st.write("ページ本文 先頭1000文字")
-        st.text(body_text[:1000])
+        try:
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            st.write("ページ本文 先頭1000文字")
+            st.text(body_text[:1000])
+        except Exception as e:
+            st.warning(f"本文取得失敗: {e}")
 
     all_urls = []
     seen_urls = set()
