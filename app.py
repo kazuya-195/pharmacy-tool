@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import time
 import os
+import subprocess
 from io import BytesIO
 from datetime import datetime
 from selenium import webdriver
@@ -12,7 +13,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ============================================================
 # 設定
@@ -57,33 +57,33 @@ DETAIL_DELAY = 1.5
 # ============================================================
 # Selenium ドライバー
 # ============================================================
+def _find_bin(candidates):
+    """システムにインストールされているバイナリのパスを返す"""
+    for name in candidates:
+        try:
+            path = subprocess.check_output(["which", name], text=True).strip()
+            if path:
+                return path
+        except Exception:
+            pass
+    return None
+
 def get_driver():
     options = Options()
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,800")
 
-    # Chromiumのパスを自動検索
-    for binary in ["/usr/bin/chromium", "/usr/bin/chromium-browser",
-                   "/usr/lib/chromium-browser/chromium-browser"]:
-        if os.path.exists(binary):
-            options.binary_location = binary
-            break
+    # Chromium本体を自動検出
+    chromium = _find_bin(["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"])
+    if chromium:
+        options.binary_location = chromium
 
-    # chromedriverを自動インストール・検出
-    try:
-        service = Service(ChromeDriverManager().install())
-    except Exception:
-        # フォールバック：システムのchromedriverを使う
-        for drv in ["/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver",
-                    "/usr/lib/chromium-browser/chromedriver"]:
-            if os.path.exists(drv):
-                service = Service(drv)
-                break
-        else:
-            service = Service()
+    # ChromeDriverを自動検出
+    chromedriver = _find_bin(["chromedriver", "chromium-chromedriver", "chromium.chromedriver"])
+    service = Service(chromedriver) if chromedriver else Service()
 
     return webdriver.Chrome(service=service, options=options)
 
