@@ -262,41 +262,43 @@ def fetch_detail(driver, name, url):
         driver.get(url)
         time.sleep(5)  # ページ描画を待つ
 
-        # 基本情報から住所を先に取得
-        txt = driver.find_element(By.TAG_NAME, "body").text
-        store["住所"] = extract_val(txt, r"所在地\s*[：:]\s*(.+?)[\n\r]")
+        # ── 基本情報タブで住所を取得 ──────────────────────────────
+        txt_basic = driver.find_element(By.TAG_NAME, "body").text
 
-        # タブをすべて取得して「実績」を含むものをクリック
-        clicked = False
+        # 住所のパターンを複数試みる
+        addr = ""
+        for pattern in [
+            r"所在地\s*[：:]\s*(.+?)[\n\r]",           # 所在地：〇〇
+            r"所在地\s*\n(.+?)[\n\r]",                  # 所在地\n〇〇
+            r"〒\d{3}[-－]\d{4}\s*(.+?)[\n\r]",        # 〒xxx-xxxx 住所
+            r"((?:北海道|東京都|大阪府|京都府|.{2,3}県).{5,50})[\n\r]",  # 都道府県から始まる行
+        ]:
+            addr = extract_val(txt_basic, pattern)
+            if addr and len(addr) > 5:
+                break
+        store["住所"] = addr
+
+        # ── 実績タブをクリック ──────────────────────────────────────
         try:
-            all_tabs = driver.find_elements(By.XPATH,
-                "//*[@role='tab' or self::li or self::a or self::button]"
-                "[contains(text(),'実績')]")
-            if not all_tabs:
-                all_tabs = driver.find_elements(By.XPATH,
-                    "//*[contains(text(),'実績')]")
+            all_tabs = driver.find_elements(By.XPATH, "//*[contains(text(),'実績')]")
             for tab in all_tabs:
                 try:
                     if tab.is_displayed():
                         driver.execute_script(
                             "arguments[0].scrollIntoView(true); arguments[0].click();", tab)
-                        time.sleep(3)  # タブ描画を待つ
-                        clicked = True
+                        time.sleep(3)
                         break
                 except Exception:
                     continue
         except Exception:
             pass
 
-        # クリック後のテキストを再取得
+        # ── 実績タブの本文から数値を取得 ───────────────────────────
         txt = driver.find_element(By.TAG_NAME, "body").text
 
         store["薬剤師_常勤"]    = extract_val(txt, r"常勤の人数[^\d]*([\d,]+)")
         store["薬剤師_非常勤"]  = extract_val(txt, r"非常勤の人数[^）]*[）)][^\d]*([\d,]+)")
         store["総取扱処方箋数"] = extract_val(txt, r"総取扱処方箋数[^\d]*([\d,]+)")
-
-        if not store["住所"]:
-            store["住所"] = extract_val(txt, r"所在地\s*[：:]\s*(.+?)[\n\r]")
 
         pref = extract_pref(store["住所"])
         store["都道府県"] = pref
