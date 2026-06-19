@@ -232,16 +232,45 @@ def search_and_collect(driver, keyword, status_text, debug=False):
 
     time.sleep(4)
 
-    # ── エラーポップアップを確認・取得 ──────────────────────────────
+    # ── モーダル/ポップアップを閉じる ────────────────────────────────
     popup = get_popup_text(driver)
-    if popup:
-        if debug:
-            st.error(f"ポップアップ検出: {popup}")
-        # alertを閉じてから続行
+    if popup and debug:
+        st.info(f"モーダル検出: {popup}")
+
+    # 「閉じる」「OK」「×」ボタンを探してクリック
+    closed = False
+    for close_sel in [
+        "button.modalClose", ".modal .close", "[class*='modal'] .close",
+        "button:has-text('閉じる')", ".modal button", "[class*='modal'] button",
+    ]:
         try:
-            driver.switch_to.default_content()
+            btns = driver.find_elements(By.CSS_SELECTOR, close_sel)
+            for b in btns:
+                if b.is_displayed() and b.text.strip() in ("閉じる", "×", "OK", "close", ""):
+                    driver.execute_script("arguments[0].click();", b)
+                    closed = True
+                    time.sleep(1)
+                    break
+            if closed:
+                break
         except Exception:
             pass
+
+    if not closed:
+        # テキストで「閉じる」ボタンを探す
+        try:
+            btns = driver.find_elements(By.XPATH,
+                "//button[normalize-space()='閉じる' or normalize-space()='OK' or normalize-space()='×']")
+            for b in btns:
+                if b.is_displayed():
+                    driver.execute_script("arguments[0].click();", b)
+                    time.sleep(1)
+                    break
+        except Exception:
+            pass
+
+    if debug and closed:
+        st.info("モーダルを閉じました")
 
     if debug:
         st.image(driver.get_screenshot_as_png(), caption="④ 検索後（ポップアップ処理済み）")
@@ -274,9 +303,20 @@ def search_and_collect(driver, keyword, status_text, debug=False):
         for item in js_links:
             name = re.sub(r"\s+", " ", item.get("text","")).strip()
             href = item.get("href","")
+            # 薬局詳細ページのURL判定：S2300以外のSコードを含むページ
+            is_detail = (
+                any(p in href for p in ["S2310","S2400","S2500","S2600","kanja","detail"])
+                or (
+                    "iryou.teikyouseido" in href
+                    and "S2300" not in href
+                    and "initialize" not in href
+                    and "juminkanja" in href
+                )
+            )
             if (name and href and len(name) >= 3
-                and "javascript" not in href and href not in seen
-                and any(p in href for p in ["S2310","S2400","S2500","kanja","detail"])
+                and "javascript" not in href
+                and href not in seen
+                and is_detail
                 and name not in SKIP):
                 page_urls.append((name, href))
                 seen.add(href)
