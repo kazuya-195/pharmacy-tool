@@ -100,22 +100,89 @@ def click_first_visible_by_text(driver, text_candidates):
 
 def collect_form_debug(driver):
     return driver.execute_script("""
-        return Array.from(document.querySelectorAll('input, select, textarea, button')).map((el, idx) => ({
-            idx: idx,
-            tag: el.tagName,
-            type: el.type || '',
-            name: el.name || '',
-            id: el.id || '',
-            placeholder: el.placeholder || '',
-            value: el.value || '',
-            text: (el.innerText || el.textContent || '').trim().substring(0, 60),
-            displayed: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-        }));
+        return Array.from(document.querySelectorAll('input, select, textarea, button')).map((el, idx) => {
+            let opts = [];
+            if (el.tagName === 'SELECT') {
+                opts = Array.from(el.options).map(o => `${o.text}:${o.value}`);
+            }
+
+            return {
+                idx: idx,
+                tag: el.tagName,
+                type: el.type || '',
+                name: el.name || '',
+                id: el.id || '',
+                placeholder: el.placeholder || '',
+                value: el.value || '',
+                text: (el.innerText || el.textContent || '').trim().substring(0, 80),
+                displayed: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),
+                options: opts.join(' | ')
+            };
+        });
     """)
+
+
+def select_facility_name_if_exists(driver, debug=False):
+    selects = driver.find_elements(By.TAG_NAME, "select")
+
+    debug_rows = []
+
+    for sel in selects:
+        if not is_visible(sel):
+            continue
+
+        name = sel.get_attribute("name") or ""
+        sel_id = sel.get_attribute("id") or ""
+        current_value = sel.get_attribute("value") or ""
+
+        try:
+            options = [
+                {
+                    "text": o.text.strip(),
+                    "value": o.get_attribute("value")
+                }
+                for o in sel.find_elements(By.TAG_NAME, "option")
+            ]
+
+            debug_rows.append({
+                "name": name,
+                "id": sel_id,
+                "current_value": current_value,
+                "options": " | ".join([f"{o['text']}:{o['value']}" for o in options])
+            })
+
+            # ナビイのキーワード検索種別
+            if name == "keywordType":
+                for opt in options:
+                    if opt["text"] == "施設名称":
+                        Select(sel).select_by_visible_text("施設名称")
+                        time.sleep(1)
+                        return True, debug_rows
+
+                # テキスト取得がうまくいかない場合の保険
+                # CSV上では value=1 が初期値。施設名称は通常 value=2 の可能性が高い
+                try:
+                    Select(sel).select_by_value("2")
+                    time.sleep(1)
+                    return True, debug_rows
+                except Exception:
+                    pass
+
+        except Exception as e:
+            debug_rows.append({
+                "name": name,
+                "id": sel_id,
+                "current_value": current_value,
+                "options": f"ERROR: {e}"
+            })
+
+    return False, debug_rows
 
 
 def fill_visible_keyword_input(driver, keyword):
     selectors = [
+        "input#keyword1",
+        "input[name='keyword']",
         "input[type='text']",
         "input[type='search']",
         "input:not([type])",
@@ -123,11 +190,22 @@ def fill_visible_keyword_input(driver, keyword):
     ]
 
     tried = []
+    used_keys = set()
+
     for selector in selectors:
         inputs = driver.find_elements(By.CSS_SELECTOR, selector)
         visible_inputs = [i for i in inputs if is_visible(i)]
 
         for el in visible_inputs:
+            key = (
+                el.get_attribute("name"),
+                el.get_attribute("id"),
+                el.get_attribute("placeholder"),
+            )
+            if key in used_keys:
+                continue
+            used_keys.add(key)
+
             info = {
                 "type": el.get_attribute("type"),
                 "name": el.get_attribute("name"),
@@ -141,6 +219,12 @@ def fill_visible_keyword_input(driver, keyword):
                 time.sleep(0.2)
                 el.clear()
                 el.send_keys(keyword)
+
+                # React/Vue系対策
+                driver.execute_script("""
+                    arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
+                    arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
+                """, el)
 
                 val = el.get_attribute("value") or ""
                 if keyword in val:
@@ -181,22 +265,6 @@ def click_search_button(driver, target_input=None):
     return False
 
 
-def select_facility_name_if_exists(driver):
-    try:
-        selects = driver.find_elements(By.TAG_NAME, "select")
-        for sel in selects:
-            if not is_visible(sel):
-                continue
-            opts = [o.text.strip() for o in sel.find_elements(By.TAG_NAME, "option")]
-            if "施設名称" in opts:
-                Select(sel).select_by_visible_text("施設名称")
-                time.sleep(0.5)
-                return True
-    except Exception:
-        pass
-    return False
-
-
 def extract_result_links(driver):
     js_links = driver.execute_script("""
         return Array.from(document.querySelectorAll('a')).map(l => ({
@@ -210,7 +278,7 @@ def extract_result_links(driver):
         "ホーム","トップ","検索","次へ","前へ","閉じる","戻る",
         "医療機関","薬局を探す","キーワード","急いで探す","じっくり探す",
         "お気に入り","都道府県","ご意見","マニュアル","リンク集","ログイン",
-        "このページの先頭へ"
+        "このページの先頭へ","English"
     }
 
     results = []
@@ -230,13 +298,11 @@ def extract_result_links(driver):
         if key in seen:
             continue
 
-        # 詳細ページっぽいURLを優先
         if href and any(x in href for x in ["S2310", "S2400", "S2500", "detail", "juminkanja"]):
             results.append((name, href))
             seen.add(key)
             continue
 
-        # SPAでhrefが変わらない場合の保険：onclick付きリンクも候補化
         if onclick and any(x in onclick for x in ["S2310", "S2400", "S2500", "detail", "select", "shosai"]):
             results.append((name, href if href else driver.current_url))
             seen.add(key)
@@ -252,7 +318,6 @@ def search_and_collect(driver, keyword, status_text, debug=False):
         debug_screenshot(driver, "① トップページ読み込み後")
         st.code(f"URL: {driver.current_url}")
 
-    # 薬局側を明示的に選択
     clicked_pharmacy, txt = click_first_visible_by_text(driver, ["薬局を探す", "薬局"])
     time.sleep(2)
 
@@ -260,7 +325,6 @@ def search_and_collect(driver, keyword, status_text, debug=False):
         st.write(f"薬局タブクリック: {clicked_pharmacy} / {txt}")
         debug_screenshot(driver, "② 薬局を探すクリック後")
 
-    # 薬局側のキーワード検索へ
     clicked_keyword, txt = click_first_visible_by_text(driver, ["キーワードで探す", "キーワード検索"])
     time.sleep(2)
 
@@ -272,7 +336,13 @@ def search_and_collect(driver, keyword, status_text, debug=False):
         st.write(f"フォーム要素数: {len(forms)}")
         st.dataframe(forms, use_container_width=True)
 
-    select_facility_name_if_exists(driver)
+    selected, select_debug = select_facility_name_if_exists(driver, debug=debug)
+
+    if debug:
+        st.write(f"施設名称選択結果: {selected}")
+        st.write("SELECT一覧")
+        st.dataframe(select_debug, use_container_width=True)
+        debug_screenshot(driver, "③-1 施設名称選択後")
 
     input_filled, target, tried = fill_visible_keyword_input(driver, keyword)
 
@@ -302,7 +372,11 @@ def search_and_collect(driver, keyword, status_text, debug=False):
             })).filter(l => l.text.length > 0 || l.href.length > 0 || l.onclick.length > 0);
         """)
         st.write(f"ページ内リンク数: {len(js_links)}")
-        st.dataframe(js_links[:80], use_container_width=True)
+        st.dataframe(js_links[:100], use_container_width=True)
+
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        st.write("ページ本文 先頭1000文字")
+        st.text(body_text[:1000])
 
     all_urls = []
     seen_urls = set()
@@ -321,7 +395,6 @@ def search_and_collect(driver, keyword, status_text, debug=False):
         all_urls.extend(new_items)
         status_text.text(f"検索中... ページ {page_num}: {len(new_items)} 件 / 累計 {len(all_urls)} 件")
 
-        # 次へ
         clicked_next = False
         next_candidates = driver.find_elements(By.XPATH, "//*[self::a or self::button][contains(normalize-space(), '次へ')]")
         for n in next_candidates:
@@ -372,7 +445,6 @@ def fetch_detail(driver, name, url):
         driver.get(url)
         time.sleep(3)
 
-        # 実績タブを探してクリック
         tab_candidates = driver.find_elements(
             By.XPATH,
             "//*[self::a or self::button or self::span or self::li or self::div]"
