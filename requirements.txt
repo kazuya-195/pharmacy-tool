@@ -1,5 +1,6 @@
 streamlit
-playwright
+anyio>=4.9.0
+uvicorn>=0.34.0
+selenium
 pandas
 openpyxl
-nest_asyncio
