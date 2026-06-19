@@ -103,9 +103,12 @@ def extract_pref(address):
     m = re.search(r"(北海道|東京都|大阪府|京都府|[^\s]{2,3}県)", address)
     return m.group(1) if m else ""
 
-def search_and_collect(driver, keyword, status_text):
+def search_and_collect(driver, keyword, status_text, debug=False):
     driver.get(BASE_URL)
-    time.sleep(3)
+    time.sleep(4)
+
+    if debug:
+        st.image(driver.get_screenshot_as_png(), caption="① トップページ読み込み後")
 
     # 薬局タブ → キーワード検索
     try:
@@ -114,9 +117,13 @@ def search_and_collect(driver, keyword, status_text):
             links[1].click()
         elif links:
             links[0].click()
-        time.sleep(1)
+        time.sleep(1.5)
     except Exception:
         pass
+
+    if debug:
+        st.image(driver.get_screenshot_as_png(), caption="② キーワードで探すクリック後")
+        st.code(f"URL: {driver.current_url}")
 
     # 施設名称を選択
     try:
@@ -138,6 +145,9 @@ def search_and_collect(driver, keyword, status_text):
     except Exception as e:
         return []
 
+    if debug:
+        st.image(driver.get_screenshot_as_png(), caption="③ キーワード入力後")
+
     # 検索ボタン
     try:
         btns = driver.find_elements(By.XPATH, "//button[contains(text(),'検索')]")
@@ -148,26 +158,35 @@ def search_and_collect(driver, keyword, status_text):
     except Exception:
         pass
 
-    time.sleep(PAGE_DELAY)
+    time.sleep(PAGE_DELAY + 1)
+
+    if debug:
+        st.image(driver.get_screenshot_as_png(), caption="④ 検索結果ページ")
+        all_links = driver.find_elements(By.TAG_NAME, "a")
+        link_data = [(l.text.strip()[:40], (l.get_attribute("href") or "")[:80]) for l in all_links if l.text.strip()]
+        st.write(f"ページ内リンク数: {len(link_data)}")
+        st.dataframe({"テキスト": [t for t,_ in link_data[:30]], "URL": [u for _,u in link_data[:30]]})
 
     # 全ページのURLを収集
     all_urls = []
     page_num = 1
     while True:
-        links = driver.find_elements(By.CSS_SELECTOR, "a[href*='S2310'], a[href*='S2400'], table a")
+        links = driver.find_elements(By.CSS_SELECTOR,
+            "a[href*='S2310'], a[href*='S2400'], a[href*='detail'], "
+            "a[href*='juminkanja'], table a, .result-list a, .facility-name a"
+        )
         page_urls = []
         for link in links:
             try:
                 name = re.sub(r"\s+", " ", link.text).strip()
-                href = link.get_attribute("href")
-                if name and href and "javascript" not in href:
+                href = link.get_attribute("href") or ""
+                if name and href and "javascript" not in href and len(name) > 2:
                     page_urls.append((name, href))
             except Exception:
                 continue
         all_urls.extend(page_urls)
-        status_text.text(f"🔍 検索中... ページ {page_num}：{len(page_urls)} 件発見")
+        status_text.text(f"検索中... ページ {page_num}: {len(page_urls)} 件")
 
-        # 次のページへ
         try:
             next_links = driver.find_elements(By.PARTIAL_LINK_TEXT, "次へ")
             if next_links and next_links[0].is_displayed():
@@ -216,11 +235,11 @@ def fetch_detail(driver, name, url):
         store["エラー"] = str(e)
     return store
 
-def run_scrape_with_keyword(company_name, keyword, progress_bar, status_text):
+def run_scrape_with_keyword(company_name, keyword, progress_bar, status_text, debug=False):
     driver = get_driver()
     all_stores = []
     try:
-        urls = search_and_collect(driver, keyword, status_text)
+        urls = search_and_collect(driver, keyword, status_text, debug=debug)
         if not urls:
             return []
         for i, (name, url) in enumerate(urls):
@@ -294,6 +313,8 @@ keyword = st.text_input(
 )
 st.caption("💡 ①と②が同じ場合はどちらも同じ名前でOKです。ナビイで薬局名を検索して確認できます。")
 
+debug_mode = st.checkbox("🔧 デバッグモード（ブラウザの動作を画像で確認）", value=False)
+
 st.divider()
 
 can_search = bool(company and keyword)
@@ -302,7 +323,7 @@ if st.button("🔍 検索開始", type="primary", disabled=not can_search):
     status   = st.empty()
     with st.spinner(f"「{keyword}」で検索中です。店舗数によって数分かかります..."):
         try:
-            stores = run_scrape_with_keyword(company, keyword, progress, status)
+            stores = run_scrape_with_keyword(company, keyword, progress, status, debug=debug_mode)
         except Exception as e:
             st.error(f"エラーが発生しました: {e}")
             stores = []
