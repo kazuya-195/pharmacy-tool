@@ -217,41 +217,65 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
         else:
             consecutive_empty = 0
 
-        # 次のページへ（SPA対応：URLではなくコンテンツの変化で判定）
+        # 次のページへ（SPA対応：広いセレクタで次ページボタンを探す）
         try:
-            nxt = driver.find_elements(By.XPATH,
-                "//a[normalize-space()='次へ'] | //button[normalize-space()='次へ'] | "
-                "//a[normalize-space()='>>'] | //input[@value='次へ']")
-            valid_nxt = [b for b in nxt
-                        if b.is_displayed()
-                        and "S2300" not in (b.get_attribute("href") or "")
-                        and "S2900" not in (b.get_attribute("href") or "")]
-            if valid_nxt:
-                # クリック前の最初の薬局名を記録
-                first_before = page_urls[0][0] if page_urls else ""
-                driver.execute_script("arguments[0].click();", valid_nxt[0])
-                time.sleep(PAGE_DELAY)
+            # ページネーション要素を広く探す
+            next_candidates = driver.execute_script("""
+                var all = document.querySelectorAll('a, button, span, li, div, input');
+                var results = [];
+                for(var i=0; i<all.length; i++){
+                    var el = all[i];
+                    var txt = (el.innerText || el.textContent || el.value || '').trim();
+                    if((txt === '次へ' || txt === '>>' || txt === '›' || txt === '»' || txt === '次')
+                       && el.offsetParent !== null){
+                        results.push({
+                            tag: el.tagName,
+                            text: txt,
+                            class: el.className,
+                            disabled: el.disabled || false
+                        });
+                    }
+                }
+                return results;
+            """)
 
-                # コンテンツが変わったか確認（SPAはURLが変わらない）
-                new_txt = driver.find_element(By.TAG_NAME, "body").text
-                first_after = ""
-                for item in driver.execute_script("""
-                    return Array.from(document.querySelectorAll('a')).map(l => ({
-                        text: (l.innerText||'').trim(), href: l.href||''
-                    }));
-                """):
-                    n = item.get("text","").strip()
-                    h = item.get("href","")
-                    if n and len(n) >= 3 and "S2430" in h:
-                        first_after = n
+            if debug:
+                st.write(f"ページ{page_num} 次ページ候補: {next_candidates}")
+
+            # 実際にクリック
+            clicked_next = False
+            for sel_xpath in [
+                "//*[normalize-space(text())='次へ' and not(@disabled)]",
+                "//*[normalize-space(text())='>>' and not(@disabled)]",
+                "//*[contains(@class,'next') and not(@disabled)]",
+                "//*[normalize-space(text())='次']",
+            ]:
+                try:
+                    btns = [b for b in driver.find_elements(By.XPATH, sel_xpath)
+                            if b.is_displayed() and b.is_enabled()]
+                    if btns:
+                        first_name_before = page_urls[0][0] if page_urls else ""
+                        driver.execute_script("arguments[0].click();", btns[0])
+                        time.sleep(PAGE_DELAY + 1)
+
+                        # コンテンツ変化を確認
+                        new_links = driver.execute_script("""
+                            return Array.from(document.querySelectorAll('a')).map(l=>({
+                                text:(l.innerText||'').trim(), href:l.href||''
+                            })).filter(l=>l.href.includes('S2430') && l.text.length>2);
+                        """)
+                        first_name_after = new_links[0]['text'] if new_links else ""
+
+                        if first_name_after and first_name_after != first_name_before:
+                            clicked_next = True
+                            page_num += 1
                         break
+                except Exception:
+                    continue
 
-                # 内容が変わっていない＝最終ページ
-                if first_after == first_before or not first_after:
-                    break
-                page_num += 1
-            else:
+            if not clicked_next:
                 break
+
         except Exception:
             break
 
