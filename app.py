@@ -217,23 +217,37 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
         else:
             consecutive_empty = 0
 
-        # 次のページへ（ページネーションボタンのみ）
+        # 次のページへ（SPA対応：URLではなくコンテンツの変化で判定）
         try:
-            # 数字ページネーションや「次へ」を探す
             nxt = driver.find_elements(By.XPATH,
                 "//a[normalize-space()='次へ'] | //button[normalize-space()='次へ'] | "
-                "//a[normalize-space()='>>'] | //span[normalize-space()='次へ']/..")
-            # 表示されていて、ナビゲーションリンクでないものを選ぶ
+                "//a[normalize-space()='>>'] | //input[@value='次へ']")
             valid_nxt = [b for b in nxt
                         if b.is_displayed()
                         and "S2300" not in (b.get_attribute("href") or "")
                         and "S2900" not in (b.get_attribute("href") or "")]
             if valid_nxt:
-                prev_url = driver.current_url
+                # クリック前の最初の薬局名を記録
+                first_before = page_urls[0][0] if page_urls else ""
                 driver.execute_script("arguments[0].click();", valid_nxt[0])
                 time.sleep(PAGE_DELAY)
-                # URLが変わらなければ終了（同じページでループしている）
-                if driver.current_url == prev_url:
+
+                # コンテンツが変わったか確認（SPAはURLが変わらない）
+                new_txt = driver.find_element(By.TAG_NAME, "body").text
+                first_after = ""
+                for item in driver.execute_script("""
+                    return Array.from(document.querySelectorAll('a')).map(l => ({
+                        text: (l.innerText||'').trim(), href: l.href||''
+                    }));
+                """):
+                    n = item.get("text","").strip()
+                    h = item.get("href","")
+                    if n and len(n) >= 3 and "S2430" in h:
+                        first_after = n
+                        break
+
+                # 内容が変わっていない＝最終ページ
+                if first_after == first_before or not first_after:
                     break
                 page_num += 1
             else:
@@ -276,7 +290,7 @@ def fetch_detail(driver, name, url):
             addr = extract_val(txt_basic, pattern)
             if addr and len(addr) > 5:
                 break
-        store["住所"] = addr
+        store["住所"] = addr.replace("Googleマップで見る", "").replace("Google マップで見る", "").strip()
 
         # ── 実績タブをクリック ──────────────────────────────────────
         try:
