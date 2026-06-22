@@ -146,9 +146,10 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
 
     # 全ページを巡回してリンク収集（最大20ページ）
     all_urls = []
+    seen = set()  # ← ループ外に置くことで全ページ通じて重複除外
     page_num = 1
     MAX_PAGES = 20
-    consecutive_empty = 0  # 連続0件カウント
+    consecutive_empty = 0
 
     while page_num <= MAX_PAGES:
         # JavaScript で全リンクを取得
@@ -189,7 +190,6 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
 
         # 薬局詳細ページのリンクを抽出
         page_urls = []
-        seen = set()
         SKIP = {"ホーム","トップ","次へ","前へ","閉じる","戻る","条件を絞り込む",
                 "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者",
                 "医療機関を探す","薬局を探す","キーワードで探す"}
