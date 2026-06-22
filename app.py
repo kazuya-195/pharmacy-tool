@@ -227,7 +227,7 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
         else:
             consecutive_empty = 0
 
-        # 次のページへ（シンプル版：>>ボタンがあればクリック、なければ終了）
+        # 次のページへ（ページ下部のボタンを使う＝最後の>>）
         try:
             clicked_next = False
             for sel_xpath in [
@@ -238,14 +238,15 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
                 btns = [b for b in driver.find_elements(By.XPATH, sel_xpath)
                         if b.is_displayed() and b.is_enabled()]
                 if btns:
-                    driver.execute_script("arguments[0].click();", btns[0])
+                    # 最後の>>（ページ下部のページネーション）をクリック
+                    driver.execute_script("arguments[0].click();", btns[-1])
                     time.sleep(PAGE_DELAY + 1)
                     clicked_next = True
                     page_num += 1
                     break
 
             if not clicked_next:
-                break  # >>ボタンが見つからない＝最終ページ
+                break
 
         except Exception:
             break
