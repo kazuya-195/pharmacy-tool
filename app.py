@@ -172,12 +172,20 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
 
         if debug:
             st.write(f"ページ{page_num}: 全リンク={len(js_links)}件, result要素={len(result_els)}件")
-            # 全リンクのうち長いテキストを持つものを表示
-            meaningful = [l for l in js_links if len(l.get('text','')) > 4
-                         and 'javascript' not in l.get('href','')
-                         and l.get('href','')]
-            st.dataframe({"テキスト": [l['text'][:40] for l in meaningful[:30]],
-                          "URL": [l['href'][:80] for l in meaningful[:30]]})
+            # result要素の最初の10件を表示（URLパターン確認用）
+            if result_els:
+                st.write("result要素（先頭10件）:")
+                st.dataframe({"テキスト": [r.get('text','')[:30] for r in result_els[:10]],
+                              "URL": [r.get('href','')[:80] for r in result_els[:10]]})
+            # 全リンクの中でiryou.teikyouseidoを含むものを表示
+            iryou_links = [l for l in js_links
+                          if "iryou.teikyouseido" in l.get('href','')
+                          and len(l.get('text','')) > 3
+                          and 'S23' not in l.get('href','')
+                          and 'S29' not in l.get('href','')]
+            st.write(f"iryou系リンク（S23/S29除く）: {len(iryou_links)}件")
+            st.dataframe({"テキスト": [l['text'][:40] for l in iryou_links[:20]],
+                          "URL": [l['href'][:80] for l in iryou_links[:20]]})
 
         # 薬局詳細ページのリンクを抽出
         page_urls = []
@@ -199,10 +207,12 @@ def collect_detail_urls(driver, session_id: str, status_text, debug: bool) -> li
                         and "javascript" not in href
                         and href not in seen
                         and name not in SKIP
-                        and any(p in href for p in ["S2430","S2420","S2440",
-                                                     "S2450","S2460","detail","yakkyoku"])
-                        and "S2410/initialize" not in href
-                        and "iryou.teikyouseido" in href):
+                        and any(p in name for p in SKIP_PATTERNS) is False
+                        and "iryou.teikyouseido" in href
+                        and not any(skip in href for skip in
+                                    ["S2300","S2310","S2320","S2400","S2410",
+                                     "S2800","S2900","S3000","S3100","S3400",
+                                     "S3870","S3880","initialize?fo"])):
                     page_urls.append((name, href))
                     seen.add(href)
 
