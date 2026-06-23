@@ -1,5 +1,4 @@
 import streamlit as st
-import requests
 import pandas as pd
 import re
 import time
@@ -70,6 +69,16 @@ def get_driver():
 # Step1: Seleniumセッションを使ってAPIで検索ID取得
 # ============================================================
 def get_session_id(driver, keyword: str, debug: bool) -> str | None:
+    """
+    ★根本修正：requestsライブラリを廃止し、Seleniumブラウザ内でfetch APIを使う。
+    
+    なぜ：ナビィはsame-originリクエスト（ブラウザから直接）しか受け付けず、
+    　　　requestsでクッキーをコピーしても HTTP 503 を返してしまう。
+    　　　Selenium経由でJavaScript fetchを実行すれば、
+    　　　ブラウザのセッション・クッキーをそのまま使えるため503を回避できる。
+    """
+    import urllib.parse
+
     base = "https://www.iryou.teikyouseido.mhlw.go.jp"
     driver.get(f"{base}/znk-web/juminkanja/S2300/initialize")
     time.sleep(4)
@@ -77,15 +86,7 @@ def get_session_id(driver, keyword: str, debug: bool) -> str | None:
     if debug:
         st.image(driver.get_screenshot_as_png(), caption="① トップページ（セッション確立）")
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": driver.execute_script("return navigator.userAgent;"),
-        "Referer": f"{base}/znk-web/juminkanja/S2300/initialize",
-    })
-    for cookie in driver.get_cookies():
-        session.cookies.set(cookie["name"], cookie["value"],
-                            domain=cookie.get("domain", ""))
-
+    # クエリパラメータを組み立てる
     params = {
         "XCHARSET": "utf-8",
         "XPARAM": "keyword",
@@ -94,31 +95,67 @@ def get_session_id(driver, keyword: str, debug: bool) -> str | None:
         "keywordType": "2",
         "keyword": keyword,
     }
+    api_url = SEARCH_API + "?" + urllib.parse.urlencode(params)
 
-    # ★修正①：リトライ付きAPI呼び出し（最大3回、タイムアウト延長）
-    last_error = None
+    if debug:
+        st.info(f"API URL: {api_url}")
+
+    # ★ Seleniumブラウザ内でfetch → クッキーはブラウザのものをそのまま使う
+    js_fetch = """
+        var callback = arguments[0];
+        var url = arguments[1];
+        fetch(url, {
+            method: 'GET',
+            credentials: 'include',
+            headers: {'Accept': 'application/json, text/plain, */*'}
+        })
+        .then(function(r) {
+            return r.text().then(function(body) {
+                return {status: r.status, body: body};
+            });
+        })
+        .then(function(result) { callback({ok: true, result: result}); })
+        .catch(function(err) { callback({ok: false, error: err.toString()}); });
+    """
+
     for attempt in range(1, 4):
         try:
             if debug and attempt > 1:
                 st.warning(f"APIリトライ {attempt}回目...")
-            r = session.get(SEARCH_API, params=params, timeout=30)  # 15→30秒に延長
+
+            # execute_async_script でPromiseの結果を受け取る
+            ret = driver.execute_async_script(js_fetch, api_url)
+
+            if not ret or not ret.get("ok"):
+                raise RuntimeError(f"fetchエラー: {ret.get('error', '不明')}")
+
+            http_status = ret["result"]["status"]
+            body        = ret["result"]["body"]
+
             if debug:
-                st.info(f"APIレスポンス [HTTP {r.status_code}]: {r.text[:300]}")
-            data = r.json()
+                st.info(f"APIレスポンス [HTTP {http_status}]: {body[:300]}")
+
+            if http_status != 200:
+                raise RuntimeError(f"HTTP {http_status} が返りました。bodyの先頭: {body[:100]}")
+
+            import json
+            data = json.loads(body)
             code = data.get("code")
             result_id = data.get("result", {}).get("id")
+
             if code != "0" or not result_id:
                 st.error(f"APIエラー: code={code}, response={data}")
                 return None
+
             return result_id
+
         except Exception as e:
-            last_error = e
-            # ★修正①：エラーの種類を詳細表示（タイムアウト？SSL？接続拒否？）
             if debug:
                 st.error(f"API呼び出し失敗 [{type(e).__name__}] (試行{attempt}/3): {e}")
-            time.sleep(3 * attempt)  # 3秒→6秒→9秒と間隔を広げる
+            if attempt < 3:
+                time.sleep(3 * attempt)
 
-    st.error(f"API呼び出し3回とも失敗: [{type(last_error).__name__}] {last_error}")
+    st.error("API呼び出し3回とも失敗しました。デバッグモードでエラー詳細を確認してください。")
     return None
 
 # ============================================================
