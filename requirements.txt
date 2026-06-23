@@ -4,3 +4,4 @@ uvicorn>=0.34.0
 selenium
 pandas
 openpyxl
+plotly
