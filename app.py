@@ -105,6 +105,24 @@ def get_session_id(driver, keyword: str, debug: bool) -> str | None:
         return None
 
 # ============================================================
+# ページ変化を待つ補助関数
+# ============================================================
+def _get_s2430_hrefs(driver) -> set:
+    return set(
+        el.get_attribute("href")
+        for el in driver.find_elements(By.XPATH, "//a[contains(@href,'S2430')]")
+        if el.get_attribute("href")
+    )
+
+def _wait_for_change(driver, before: set, timeout: int = 12) -> bool:
+    for _ in range(timeout * 2):
+        time.sleep(0.5)
+        after = _get_s2430_hrefs(driver)
+        if after and after != before:
+            return True
+    return False
+
+# ============================================================
 # Step2: 結果ページから店舗リンクを収集
 # ============================================================
 def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
@@ -112,7 +130,7 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
     time.sleep(PAGE_DELAY)
 
     if debug:
-        st.image(driver.get_screenshot_as_png(), caption="② 結果ページ")
+        st.image(driver.get_screenshot_as_png(), caption="② 結果ページ（初期）")
 
     # モーダルを閉じる
     for sel in ["button.modalClose", "[class*='modal'] button", "button"]:
@@ -128,9 +146,7 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
     time.sleep(1)
 
     all_urls = []
-    page_num = 1
-    MAX_PAGES = 20
-    consecutive_empty = 0
+    seen_hrefs = set()
 
     SKIP = {"ホーム","トップ","次へ","前へ","閉じる","戻る","条件を絞り込む",
             "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者",
@@ -138,110 +154,107 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
     SKIP_PATTERNS = ["window","オブジェクト","//","function","undefined",
                      "null","Copyright","javascript","Script"]
 
-    while page_num <= MAX_PAGES:
+    def collect_page(page_num):
+        """現在表示中のページからS2430リンクを収集して新規分をall_urlsに追加"""
         js_links = driver.execute_script("""
             return Array.from(document.querySelectorAll('a')).map(l => ({
                 text: (l.innerText || l.textContent || '').trim(),
                 href: l.href || ''
             }));
         """)
-
         if debug:
-            st.write(f"ページ{page_num}: {len(js_links)}リンク")
+            st.write(f"ページ{page_num}: 全{len(js_links)}リンク")
 
         page_urls = []
-        seen = set()
-
+        page_seen = set()
         for item in js_links:
             name = re.sub(r"\s+", " ", item.get("text","")).strip()
             href = item.get("href","")
             if (name and href
                     and len(name) >= 3
                     and "javascript" not in href
-                    and href not in seen
+                    and href not in page_seen
                     and name not in SKIP
                     and not any(p in name for p in SKIP_PATTERNS)
                     and "iryou.teikyouseido" in href
                     and "S2430" in href):
                 page_urls.append((name, href))
-                seen.add(href)
+                page_seen.add(href)
 
-        # 既収集分との重複を除く
-        new_urls = [(n, h) for n, h in page_urls
-                    if h not in {u for _, u in all_urls}]
-        all_urls.extend(new_urls)
-        status_text.text(f"収集中... ページ{page_num}: {len(new_urls)}件 / 累計{len(all_urls)}件")
+        new_count = 0
+        for name, href in page_urls:
+            if href not in seen_hrefs:
+                all_urls.append((name, href))
+                seen_hrefs.add(href)
+                new_count += 1
 
         if debug:
-            st.write(f"→ S2430リンク: {len(page_urls)}件 / 新規: {len(new_urls)}件 / 累計: {len(all_urls)}件")
+            st.write(f"→ S2430: {len(page_urls)}件 / 新規: {new_count}件 / 累計: {len(all_urls)}件")
 
-        if len(new_urls) == 0:
-            consecutive_empty += 1
-            if consecutive_empty >= 2:
-                break
-        else:
-            consecutive_empty = 0
+        status_text.text(f"収集中... ページ{page_num}: {new_count}件 / 累計{len(all_urls)}件")
+        return new_count
 
-        # ★次ページへ：JS dispatchEventで確実にクリック
-        try:
-            clicked = driver.execute_script("""
-                var candidates = Array.from(document.querySelectorAll('a, button, li, span'));
-                var nextBtns = candidates.filter(function(el) {
-                    var txt = (el.innerText || el.textContent || '').trim();
-                    var style = window.getComputedStyle(el);
-                    return (txt === '>>' || txt === '次へ')
+    # ページ1を収集
+    collect_page(1)
+
+    # ページ番号ボタンを使って2,3,4...と順番に遷移
+    # ★ >> は「最終ページへ」なので使わない。数字ボタンを順番にクリックする。
+    next_page_num = 2
+    MAX_PAGES = 30
+
+    while next_page_num <= MAX_PAGES:
+        # ★クリック前にS2430 URLセットを記録（競合バグ修正）
+        before = _get_s2430_hrefs(driver)
+
+        # ページ番号ボタンをJS経由でクリック
+        clicked = driver.execute_script("""
+            var target = arguments[0].toString();
+            // ページネーション内の数字リンク・ボタンを探す
+            var candidates = Array.from(document.querySelectorAll('a, button, li, span'));
+            var pageBtn = null;
+            for (var i = 0; i < candidates.length; i++) {
+                var el = candidates[i];
+                var txt = (el.innerText || el.textContent || '').trim();
+                var style = window.getComputedStyle(el);
+                if (txt === target
                         && style.display !== 'none'
-                        && style.visibility !== 'hidden'
-                        && !el.disabled;
-                });
-                if (nextBtns.length === 0) return 'NOT_FOUND';
-                var btn = nextBtns[nextBtns.length - 1];
-                btn.scrollIntoView({block:'center'});
-                btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
-                return 'CLICKED:' + btn.tagName + ':' + (btn.className || '');
-            """)
+                        && style.visibility !== 'hidden') {
+                    pageBtn = el;
+                    // より後ろにあるもの（フッター側のナビ）を優先
+                }
+            }
+            if (!pageBtn) return 'NOT_FOUND';
+            pageBtn.scrollIntoView({block:'center'});
+            pageBtn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+            return 'CLICKED:' + pageBtn.tagName + ':' + pageBtn.textContent.trim();
+        """, next_page_num)
 
+        if debug:
+            st.write(f"ページ{next_page_num}ボタン クリック結果: {clicked}")
+
+        if clicked == 'NOT_FOUND':
             if debug:
-                st.write(f">> クリック結果: {clicked}")
-                st.image(driver.get_screenshot_as_png(), caption=f"ページ{page_num} クリック直後")
+                st.info(f"ページ{next_page_num}ボタンが見つかりません → 収集終了")
+            break
 
-            if clicked == 'NOT_FOUND':
-                if debug:
-                    st.info(">> ボタンが見つかりません → 収集終了")
-                break
+        # ページ内容が変わるまで待機
+        changed = _wait_for_change(driver, before, timeout=12)
 
-            # ★クリック後：S2430 URLセットが変化するまで最大12秒待つ
-            before_urls = set(
-                el.get_attribute("href")
-                for el in driver.find_elements(By.XPATH, "//a[contains(@href,'S2430')]")
-                if el.get_attribute("href")
-            )
+        if debug:
+            st.write(f"ページ変化: {'あり ✅' if changed else 'なし ❌'}")
+            if changed:
+                st.image(driver.get_screenshot_as_png(), caption=f"ページ{next_page_num} 遷移後")
 
-            changed = False
-            for _ in range(24):
-                time.sleep(0.5)
-                after_urls = set(
-                    el.get_attribute("href")
-                    for el in driver.find_elements(By.XPATH, "//a[contains(@href,'S2430')]")
-                    if el.get_attribute("href")
-                )
-                if after_urls and after_urls != before_urls:
-                    changed = True
-                    break
-
+        if not changed:
             if debug:
-                st.write(f"ページ変化: {'あり ✅' if changed else 'なし ❌（12秒タイムアウト）'}")
-                if changed:
-                    st.image(driver.get_screenshot_as_png(), caption=f"ページ{page_num+1} 遷移後")
+                st.warning(f"ページ{next_page_num}への遷移が確認できませんでした → 終了")
+            break
 
-            if not changed:
-                break
+        new_count = collect_page(next_page_num)
+        next_page_num += 1
 
-            page_num += 1
-
-        except Exception as e:
-            if debug:
-                st.error(f"ページネーション例外: {e}")
+        # 新規が0件で2ページ連続したら終了（安全弁）
+        if new_count == 0 and next_page_num > 3:
             break
 
     return all_urls
@@ -292,7 +305,7 @@ def fetch_detail(driver, name, url):
 
         txt = driver.find_element(By.TAG_NAME, "body").text
         store["薬剤師_常勤"]    = extract_val(txt, r"常勤の人数[^\d]*([\d,]+)")
-        store["薬剤師_非常勤"]  = extract_val(txt, r"非常勤の人数[^）]*[）)][^\d]*([\d,]+)")
+        store["薬剤師_非常勤"]  = extract_val(txt, r"非常勤の人数[^）]*[）)][^\d,]*([\d,]+)")
         store["総取扱処方箋数"] = extract_val(txt, r"総取扱処方箋数[^\d]*([\d,]+)")
         if not store["住所"]:
             store["住所"] = extract_val(txt, r"所在地\s*[：:]\s*(.+?)[\n\r]")
