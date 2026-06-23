@@ -15,7 +15,7 @@ from selenium.webdriver.common.by import By
 # ============================================================
 # 設定
 # ============================================================
-SEARCH_API  = "https://www.iryou.teikyouseido.mhlw.go.jp/znk-web/juminkanja/S2300/yakkyokuSearch"
+SEARCH_API   = "https://www.iryou.teikyouseido.mhlw.go.jp/znk-web/juminkanja/S2300/yakkyokuSearch"
 RESULTS_BASE = "https://www.iryou.teikyouseido.mhlw.go.jp/znk-web/juminkanja/S2400/initialize?id="
 PAGE_DELAY   = 2.5
 DETAIL_DELAY = 1.5
@@ -94,15 +94,80 @@ def get_session_id(driver, keyword: str, debug: bool) -> str | None:
         "keywordType": "2",
         "keyword": keyword,
     }
-    try:
-        r = session.get(SEARCH_API, params=params, timeout=15)
-        data = r.json()
-        if debug:
-            st.info(f"APIレスポンス: {data}")
-        return data.get("result", {}).get("id")
-    except Exception as e:
-        st.error(f"API呼び出し失敗: {e}")
-        return None
+
+    # ★修正①：リトライ付きAPI呼び出し（最大3回、タイムアウト延長）
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            if debug and attempt > 1:
+                st.warning(f"APIリトライ {attempt}回目...")
+            r = session.get(SEARCH_API, params=params, timeout=30)  # 15→30秒に延長
+            if debug:
+                st.info(f"APIレスポンス [HTTP {r.status_code}]: {r.text[:300]}")
+            data = r.json()
+            code = data.get("code")
+            result_id = data.get("result", {}).get("id")
+            if code != "0" or not result_id:
+                st.error(f"APIエラー: code={code}, response={data}")
+                return None
+            return result_id
+        except Exception as e:
+            last_error = e
+            # ★修正①：エラーの種類を詳細表示（タイムアウト？SSL？接続拒否？）
+            if debug:
+                st.error(f"API呼び出し失敗 [{type(e).__name__}] (試行{attempt}/3): {e}")
+            time.sleep(3 * attempt)  # 3秒→6秒→9秒と間隔を広げる
+
+    st.error(f"API呼び出し3回とも失敗: [{type(last_error).__name__}] {last_error}")
+    return None
+
+# ============================================================
+# ページネーション補助関数
+# ============================================================
+
+def _get_current_s2430_urls(driver) -> set:
+    """現在ページに表示中のS2430リンクURLセットを返す"""
+    links = driver.find_elements(By.XPATH, "//a[contains(@href, 'S2430')]")
+    return {l.get_attribute("href") for l in links if l.is_displayed() and l.get_attribute("href")}
+
+
+def _find_next_button(driver, debug: bool):
+    """
+    >> または 次へ ボタンを返す。
+    ★修正②：LI要素を除外し、A/button要素のみ対象にする。
+    複数ある場合は最後のもの（= ページ下部のナビ）を選ぶ。
+    """
+    for xpath in [
+        # A要素またはbutton要素の >> （LIは除外）
+        "(//a | //button)[normalize-space(.)='>>' and not(@disabled)]",
+        "(//a | //button)[normalize-space(.)='次へ' and not(@disabled)]",
+        # span等で >> を囲んでいる場合の親A
+        "//a[.//*[normalize-space(text())='>>'] and not(@disabled)]",
+    ]:
+        found = [
+            b for b in driver.find_elements(By.XPATH, xpath)
+            if b.is_displayed() and b.is_enabled()
+        ]
+        if found:
+            if debug:
+                tags = [(b.tag_name, b.text.strip()) for b in found]
+                st.write(f"「>>」ボタン検出: {tags} → 最後の要素をクリック")
+            return found[-1]
+    return None
+
+
+def _wait_for_page_change(driver, old_urls: set, timeout: int = 12) -> bool:
+    """
+    ★修正③：固定sleepではなくS2430リンクのURLセット変化でページ更新を検知する。
+    最大timeout秒待機。変化したらTrue、タイムアウトでFalse。
+    """
+    for _ in range(timeout * 2):  # 0.5秒ずつポーリング
+        time.sleep(0.5)
+        new_urls = _get_current_s2430_urls(driver)
+        # URLセットが変わった、かつ新しいURLが存在する場合に更新と判断
+        if new_urls and new_urls != old_urls:
+            return True
+    return False
 
 # ============================================================
 # Step2: 結果ページから店舗リンクを収集
@@ -112,7 +177,7 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
     time.sleep(PAGE_DELAY)
 
     if debug:
-        st.image(driver.get_screenshot_as_png(), caption="② 結果ページ")
+        st.image(driver.get_screenshot_as_png(), caption="② 結果ページ（初期表示）")
 
     # モーダルを閉じる
     for sel in ["button.modalClose", "[class*='modal'] button", "button"]:
@@ -127,13 +192,19 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
 
     time.sleep(1)
 
-    all_urls = []
-    page_num = 1
-    MAX_PAGES = 20
-    consecutive_empty = 0
+    all_urls    = []
+    seen_hrefs  = set()
+    page_num    = 1
+    MAX_PAGES   = 20
+
+    SKIP = {"ホーム","トップ","次へ","前へ","閉じる","戻る","条件を絞り込む",
+            "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者",
+            "医療機関を探す","薬局を探す","キーワードで探す","アイコンの説明"}
+    SKIP_PATTERNS = ["window","オブジェクト","//","function","undefined",
+                     "null","Copyright","javascript","Script"]
 
     while page_num <= MAX_PAGES:
-        # JavaScriptで全リンク取得
+        # ---- 現在ページのS2430リンクを収集 ----
         js_links = driver.execute_script("""
             return Array.from(document.querySelectorAll('a')).map(l => ({
                 text: (l.innerText || l.textContent || '').trim(),
@@ -141,66 +212,64 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
             }));
         """)
 
-        if debug:
-            st.write(f"ページ{page_num}: {len(js_links)}リンク")
-
-        # 薬局詳細リンクを抽出
         page_urls = []
-        seen = set()
-        SKIP = {"ホーム","トップ","次へ","前へ","閉じる","戻る","条件を絞り込む",
-                "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者",
-                "医療機関を探す","薬局を探す","キーワードで探す","アイコンの説明"}
-        SKIP_PATTERNS = ["window","オブジェクト","//","function","undefined",
-                         "null","Copyright","javascript","Script"]
-
+        page_seen = set()
         for item in js_links:
-            name = re.sub(r"\s+", " ", item.get("text","")).strip()
-            href = item.get("href","")
+            name = re.sub(r"\s+", " ", item.get("text", "")).strip()
+            href = item.get("href", "")
             if (name and href
                     and len(name) >= 3
                     and "javascript" not in href
-                    and href not in seen
+                    and href not in page_seen
                     and name not in SKIP
                     and not any(p in name for p in SKIP_PATTERNS)
                     and "iryou.teikyouseido" in href
                     and "S2430" in href):
                 page_urls.append((name, href))
-                seen.add(href)
+                page_seen.add(href)
 
-        # 既収集分との重複を除く
-        new_urls = [(n, h) for n, h in page_urls
-                    if h not in {u for _, u in all_urls}]
-        all_urls.extend(new_urls)
-        status_text.text(f"収集中... ページ{page_num}: {len(new_urls)}件 / 累計{len(all_urls)}件")
+        new_count = 0
+        for name, href in page_urls:
+            if href not in seen_hrefs:
+                all_urls.append((name, href))
+                seen_hrefs.add(href)
+                new_count += 1
 
-        if len(new_urls) == 0:
-            consecutive_empty += 1
-            if consecutive_empty >= 2:
-                break
-        else:
-            consecutive_empty = 0
+        status_text.text(f"収集中... ページ{page_num}: {new_count}件 / 累計{len(all_urls)}件")
 
-        # 次ページへ（最後の>>をクリック）
-        try:
-            btns = []
-            for xpath in [
-                "//*[normalize-space(text())='>>' and not(@disabled)]",
-                "//*[normalize-space(text())='次へ' and not(@disabled)]",
-            ]:
-                found = [b for b in driver.find_elements(By.XPATH, xpath)
-                         if b.is_displayed() and b.is_enabled()]
-                if found:
-                    btns = found
-                    break
+        if debug:
+            st.write(f"**ページ{page_num}**: 検出{len(page_urls)}件 / 新規{new_count}件 / 累計{len(all_urls)}件")
+            if page_num == 1:
+                st.image(driver.get_screenshot_as_png(), caption=f"ページ{page_num} 表示内容")
 
-            if btns:
-                driver.execute_script("arguments[0].click();", btns[-1])
-                time.sleep(PAGE_DELAY + 1)
-                page_num += 1
-            else:
-                break
-        except Exception:
+        # ---- 次ページへの遷移 ----
+        # ★修正③：クリック前に現在のURLセットを記録
+        current_s2430_urls = _get_current_s2430_urls(driver)
+
+        # ★修正②：A/button限定で >> ボタンを探す
+        next_btn = _find_next_button(driver, debug)
+
+        if next_btn is None:
+            if debug:
+                st.info(f"ページ{page_num}：「>>」ボタンが見つかりません → 収集終了")
             break
+
+        # クリック実行
+        driver.execute_script("arguments[0].click();", next_btn)
+
+        # ★修正③：固定sleepではなくDOM変化を検知して待機
+        changed = _wait_for_page_change(driver, current_s2430_urls, timeout=12)
+
+        if not changed:
+            if debug:
+                st.warning(f"ページ{page_num}：クリック後12秒待ってもページが変化しませんでした → 終了")
+                st.image(driver.get_screenshot_as_png(), caption=f"変化なし（ページ{page_num}）")
+            break
+
+        page_num += 1
+
+        if debug:
+            st.image(driver.get_screenshot_as_png(), caption=f"ページ{page_num} 遷移後")
 
     return all_urls
 
@@ -223,7 +292,6 @@ def fetch_detail(driver, name, url):
         driver.get(url)
         time.sleep(5)
 
-        # 基本情報タブで住所取得
         txt = driver.find_element(By.TAG_NAME, "body").text
         addr = ""
         for pattern in [
@@ -237,7 +305,6 @@ def fetch_detail(driver, name, url):
                 break
         store["住所"] = addr.replace("Googleマップで見る","").replace("Google マップで見る","").strip()
 
-        # 実績タブをクリック
         for xpath in ["//*[contains(text(),'実績、結果')]",
                       "//*[contains(text(),'実績・結果')]",
                       "//*[contains(text(),'実績')]"]:
@@ -276,7 +343,7 @@ def run(company, keyword, progress_bar, status_text, debug):
         if not session_id:
             return []
         if debug:
-            st.info(f"セッションID: {session_id}")
+            st.info(f"セッションID取得成功: {session_id}")
 
         status_text.text("📋 検索結果を収集中...")
         urls = collect_urls(driver, session_id, status_text, debug)
