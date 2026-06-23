@@ -178,12 +178,15 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
         else:
             consecutive_empty = 0
 
-        # 次ページへ（最後の>>をクリック）
+        # 次ページへ
+        # ★修正①: A/button要素のみ対象（LI要素を除外）
+        # ★修正②: クリック後にS2430リンクのURLセットが変化するまで待つ
         try:
             btns = []
             for xpath in [
-                "//*[normalize-space(text())='>>' and not(@disabled)]",
-                "//*[normalize-space(text())='次へ' and not(@disabled)]",
+                "(//a | //button)[normalize-space(.)='>>' and not(@disabled)]",
+                "(//a | //button)[normalize-space(.)='次へ' and not(@disabled)]",
+                "//a[.//*[normalize-space(text())='>>'] and not(@disabled)]",
             ]:
                 found = [b for b in driver.find_elements(By.XPATH, xpath)
                          if b.is_displayed() and b.is_enabled()]
@@ -191,12 +194,36 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
                     btns = found
                     break
 
-            if btns:
-                driver.execute_script("arguments[0].click();", btns[-1])
-                time.sleep(PAGE_DELAY + 1)
-                page_num += 1
-            else:
+            if not btns:
                 break
+
+            # クリック前のS2430 URLセットを記録
+            before_urls = set(
+                el.get_attribute("href")
+                for el in driver.find_elements(By.XPATH, "//a[contains(@href,'S2430')]")
+                if el.is_displayed() and el.get_attribute("href")
+            )
+
+            driver.execute_script("arguments[0].click();", btns[-1])
+
+            # ページ内容が変わるまで最大12秒ポーリング（0.5秒ごと）
+            changed = False
+            for _ in range(24):
+                time.sleep(0.5)
+                after_urls = set(
+                    el.get_attribute("href")
+                    for el in driver.find_elements(By.XPATH, "//a[contains(@href,'S2430')]")
+                    if el.is_displayed() and el.get_attribute("href")
+                )
+                if after_urls and after_urls != before_urls:
+                    changed = True
+                    break
+
+            if not changed:
+                break
+
+            page_num += 1
+
         except Exception:
             break
 
