@@ -132,6 +132,12 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
     MAX_PAGES = 20
     consecutive_empty = 0
 
+    SKIP = {"ホーム","トップ","次へ","前へ","閉じる","戻る","条件を絞り込む",
+            "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者",
+            "医療機関を探す","薬局を探す","キーワードで探す","アイコンの説明"}
+    SKIP_PATTERNS = ["window","オブジェクト","//","function","undefined",
+                     "null","Copyright","javascript","Script"]
+
     while page_num <= MAX_PAGES:
         js_links = driver.execute_script("""
             return Array.from(document.querySelectorAll('a')).map(l => ({
@@ -145,11 +151,6 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
 
         page_urls = []
         seen = set()
-        SKIP = {"ホーム","トップ","次へ","前へ","閉じる","戻る","条件を絞り込む",
-                "全国の薬局","検索条件","お気に入り","ログイン","利用規約","関係者",
-                "医療機関を探す","薬局を探す","キーワードで探す","アイコンの説明"}
-        SKIP_PATTERNS = ["window","オブジェクト","//","function","undefined",
-                         "null","Copyright","javascript","Script"]
 
         for item in js_links:
             name = re.sub(r"\s+", " ", item.get("text","")).strip()
@@ -171,6 +172,9 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
         all_urls.extend(new_urls)
         status_text.text(f"収集中... ページ{page_num}: {len(new_urls)}件 / 累計{len(all_urls)}件")
 
+        if debug:
+            st.write(f"→ S2430リンク: {len(page_urls)}件 / 新規: {len(new_urls)}件 / 累計: {len(all_urls)}件")
+
         if len(new_urls) == 0:
             consecutive_empty += 1
             if consecutive_empty >= 2:
@@ -178,53 +182,66 @@ def collect_urls(driver, session_id: str, status_text, debug: bool) -> list:
         else:
             consecutive_empty = 0
 
-        # 次ページへ
-        # ★修正①: A/button要素のみ対象（LI要素を除外）
-        # ★修正②: クリック後にS2430リンクのURLセットが変化するまで待つ
+        # ★次ページへ：JS dispatchEventで確実にクリック
         try:
-            btns = []
-            for xpath in [
-                "(//a | //button)[normalize-space(.)='>>' and not(@disabled)]",
-                "(//a | //button)[normalize-space(.)='次へ' and not(@disabled)]",
-                "//a[.//*[normalize-space(text())='>>'] and not(@disabled)]",
-            ]:
-                found = [b for b in driver.find_elements(By.XPATH, xpath)
-                         if b.is_displayed() and b.is_enabled()]
-                if found:
-                    btns = found
-                    break
+            clicked = driver.execute_script("""
+                var candidates = Array.from(document.querySelectorAll('a, button, li, span'));
+                var nextBtns = candidates.filter(function(el) {
+                    var txt = (el.innerText || el.textContent || '').trim();
+                    var style = window.getComputedStyle(el);
+                    return (txt === '>>' || txt === '次へ')
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && !el.disabled;
+                });
+                if (nextBtns.length === 0) return 'NOT_FOUND';
+                var btn = nextBtns[nextBtns.length - 1];
+                btn.scrollIntoView({block:'center'});
+                btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+                return 'CLICKED:' + btn.tagName + ':' + (btn.className || '');
+            """)
 
-            if not btns:
+            if debug:
+                st.write(f">> クリック結果: {clicked}")
+                st.image(driver.get_screenshot_as_png(), caption=f"ページ{page_num} クリック直後")
+
+            if clicked == 'NOT_FOUND':
+                if debug:
+                    st.info(">> ボタンが見つかりません → 収集終了")
                 break
 
-            # クリック前のS2430 URLセットを記録
+            # ★クリック後：S2430 URLセットが変化するまで最大12秒待つ
             before_urls = set(
                 el.get_attribute("href")
                 for el in driver.find_elements(By.XPATH, "//a[contains(@href,'S2430')]")
-                if el.is_displayed() and el.get_attribute("href")
+                if el.get_attribute("href")
             )
 
-            driver.execute_script("arguments[0].click();", btns[-1])
-
-            # ページ内容が変わるまで最大12秒ポーリング（0.5秒ごと）
             changed = False
             for _ in range(24):
                 time.sleep(0.5)
                 after_urls = set(
                     el.get_attribute("href")
                     for el in driver.find_elements(By.XPATH, "//a[contains(@href,'S2430')]")
-                    if el.is_displayed() and el.get_attribute("href")
+                    if el.get_attribute("href")
                 )
                 if after_urls and after_urls != before_urls:
                     changed = True
                     break
+
+            if debug:
+                st.write(f"ページ変化: {'あり ✅' if changed else 'なし ❌（12秒タイムアウト）'}")
+                if changed:
+                    st.image(driver.get_screenshot_as_png(), caption=f"ページ{page_num+1} 遷移後")
 
             if not changed:
                 break
 
             page_num += 1
 
-        except Exception:
+        except Exception as e:
+            if debug:
+                st.error(f"ページネーション例外: {e}")
             break
 
     return all_urls
